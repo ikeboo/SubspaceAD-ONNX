@@ -1,0 +1,18 @@
+[project]
+name = "subspacead"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "torch",
+    "torchvision",
+    "transformers",
+    "opencv-python",
+    "onnxruntime",
+    "onnxscript",
+    "ipykernel",
+    "matplotlib",
+    "tqdm"
+]
