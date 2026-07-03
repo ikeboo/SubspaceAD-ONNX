@@ -40,6 +40,7 @@ class SubspaceAD:
         model_name: str = "dinov3_vitsplus",
         *,
         dino=None,
+        providers: list[str] | None = None,
         pca_ev: Optional[float] = 0.99,
         pca_dim: Optional[int] = None,
         max_fit_tokens: Optional[int] = None,
@@ -57,6 +58,9 @@ class SubspaceAD:
             dino:
                 既に生成済みのDINOv3インスタンスを渡す場合に使用。
                 Noneの場合は DINOv3(model_name) を呼ぶ。
+            providers:
+                DINOv3のONNX Runtimeに渡すExecution Providerの優先順。
+                dinoを直接渡す場合は指定できません。
             pca_ev:
                 PCAで保持する累積寄与率。pca_dimがNoneのとき有効。
                 公式実装のデフォルトに近い 0.99 を既定値にしています。
@@ -81,7 +85,14 @@ class SubspaceAD:
                 max_fit_tokens使用時の乱数seed。
         """
         self.model_name = model_name
-        self.dino = dino if dino is not None else DINOv3(model_name)
+        self.providers = list(providers) if providers is not None else None
+        if dino is not None and providers is not None:
+            raise ValueError("providers cannot be specified when dino is provided.")
+        self.dino = (
+            dino
+            if dino is not None
+            else DINOv3(model_name, providers=self.providers)
+        )
 
         if pca_ev is None and pca_dim is None:
             raise ValueError("pca_ev または pca_dim のどちらかは指定してください。")

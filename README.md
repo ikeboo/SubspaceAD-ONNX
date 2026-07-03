@@ -16,7 +16,7 @@ uv sync
 The following command exports a DINOv3 ViT-B/16 model using its middle seven layers:
 
 ```bash
-uv run python export_dinov3_middle_onnx.py
+uv run python subspaceadonnx/tools/export_onnx.py
 ```
 
 It creates the following files:
@@ -29,7 +29,8 @@ models/dinov3_vitb_middle7.json
 You can specify a different image size or set of intermediate layers:
 
 ```bash
-uv run python export_dinov3_middle_onnx.py \
+uv run python subspaceadonnx/tools/export_onnx.py \
+  --model-name facebook/dinov3-vitb16-pretrain-lvd1689m \
   --height 448 \
   --width 448 \
   --layers 4,5,6,7,8,9,10 \
@@ -92,17 +93,25 @@ mask = model.predict_mask("data/test/sample.png", threshold=0.5)
 Use `MVTecEvaluator` to evaluate MVTec-style datasets and append results to `results.csv` at the dataset root:
 
 ```python
-from mvtec_evaluation import MVTecEvaluator
+from subspaceadonnx import MVTecEvaluator
 
 evaluator = MVTecEvaluator(
     dataset_root="datasets",
     dataset_names=["leather"],
-    description="SubspaceAD DINOv3 evaluation",
-    model=model,
+    onnx_path="models/dinov3_vitb_middle7.onnx",
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
 )
 result = evaluator.evaluate()
 print(result)
 ```
+
+For each dataset category, the evaluator trains a new `SubspaceAD` model with
+the images under `train/good`, runs inference on all images under `test`, and
+then calculates the metrics. Training, inference (`n/N` images), and evaluation
+status are displayed while it runs. To customize `SubspaceAD`, pass its keyword
+arguments through `model_kwargs`, for example `model_kwargs={"pca_ev": 0.95}`.
+The same `providers` argument can also be passed directly to `SubspaceAD` and
+`DINOv3`. Providers are tried in the given priority order.
 
 For evaluation, keep `normalize_map=False` (the default). AUROC and average
 precision use score ordering, while AU-PRO sweeps thresholds over the shared
@@ -114,7 +123,7 @@ See [inference.ipynb](inference.ipynb) for additional visualization and examples
 
 ## Project files
 
-- `export_dinov3_middle_onnx.py`: Exports intermediate DINOv3 features to ONNX
+- `export_onnx.py`: Exports intermediate DINOv3 features to ONNX
 - `dinov3_onnx.py`: Handles preprocessing and feature extraction with ONNX Runtime
 - `subspacead_onnx.py`: Learns the normal PCA subspace and calculates anomaly scores
 - `inference.ipynb`: Provides inference and visualization examples

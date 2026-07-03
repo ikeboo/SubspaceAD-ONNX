@@ -27,6 +27,13 @@ class DINOv3:
         *,
         providers: list[str] | None = None,
     ):
+        """Create an ONNX feature extractor.
+
+        Args:
+            onnx_path: Path to the ONNX model.
+            providers: ONNX Runtime Execution Providers in priority order.
+                Unsupported providers are ignored. If none remain, CPU is used.
+        """
         self.onnx_path = str(onnx_path)
 
         meta_path = Path(onnx_path).with_suffix(".json")
@@ -54,16 +61,21 @@ class DINOv3:
         self.std = np.asarray(std, dtype=np.float32).reshape(1, 1, 3)
 
         if providers is None:
-            providers = ["CUDAExecutionProvider","WebGpuExecutionProvider", "CPUExecutionProvider"]
+            # WebGPU can be listed by ONNX Runtime even when the host has no
+            # usable adapter; initializing it then terminates the process in
+            # some environments. Keep it available through an explicit
+            # ``providers`` argument, but use safe defaults here.
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
         available = ort.get_available_providers()
         providers = [p for p in providers if p in available]
         if not providers:
             providers = ["CPUExecutionProvider"]
+        self.providers = list(providers)
 
         self.session = ort.InferenceSession(
             self.onnx_path,
-            providers=providers,
+            providers=self.providers,
         )
 
         self.input_name = self.session.get_inputs()[0].name

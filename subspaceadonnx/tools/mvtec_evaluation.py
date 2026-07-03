@@ -3,28 +3,34 @@ from __future__ import annotations
 import csv
 import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import cv2
 import numpy as np
+from tqdm.auto import tqdm
+
+from ..core.subspacead import SubspaceAD
 
 
 class MVTecEvaluator:
     """Evaluate MVTec-style datasets and append results to results.csv.
 
-    The evaluator accepts a callable that computes an anomaly map for a given
-    image path. It then computes image-level AUROC/AUPR, pixel-level AUROC,
-    and normalized area under the PRO curve up to the configured FPR limit.
-    Multiple dataset categories are evaluated separately and macro-averaged.
+    A separate SubspaceAD model is trained from each category's ``train/good``
+    images, then evaluated against that category's test images. It computes
+    image-level AUROC/AUPR, pixel-level AUROC, and normalized area under the PRO
+    curve up to the configured FPR limit. Multiple categories are evaluated
+    separately and macro-averaged.
     """
 
     def __init__(
         self,
         dataset_root: str,
         dataset_names: list[str],
-        description: str,
-        model: object,
+        onnx_path: str,
         *,
+        description: str | None = None,
+        providers: list[str] | None = None,
+        model_kwargs: Mapping[str, object] | None = None,
         image_score_method: str = "mtop1p",
         use_mask_output: bool = False,
         mask_threshold: float = 0.5,
@@ -34,68 +40,105 @@ class MVTecEvaluator:
     ):
         self.dataset_root = Path(dataset_root)
         self.dataset_names = dataset_names
-        self.description = description
-        self.model = model
+        self.onnx_path = Path(onnx_path)
+        self.description = description or self.onnx_path.stem
+        self.providers = list(providers) if providers is not None else None
+        self.model_kwargs = dict(model_kwargs or {})
         self.image_score_method = image_score_method
         self.use_mask_output = use_mask_output
         self.mask_threshold = mask_threshold
         self.pro_fpr_limit = float(pro_fpr_limit)
         self.pro_num_thresholds = int(pro_num_thresholds)
         self.results_path = self.dataset_root / results_filename
+        self._shared_dino: object | None = None
 
         if not self.dataset_root.exists():
             raise FileNotFoundError(f"dataset_root not found: {self.dataset_root}")
+        if not self.onnx_path.exists():
+            raise FileNotFoundError(f"onnx_path not found: {self.onnx_path}")
+        if len(set(self.dataset_names)) != len(self.dataset_names):
+            raise ValueError("dataset_names must not contain duplicates.")
+        if "providers" in self.model_kwargs:
+            raise ValueError(
+                "Pass providers through the providers argument, not model_kwargs."
+            )
         if not 0.0 < self.pro_fpr_limit <= 1.0:
             raise ValueError("pro_fpr_limit must be in (0, 1].")
         if self.pro_num_thresholds < 2:
             raise ValueError("pro_num_thresholds must be at least 2.")
 
     def evaluate(self) -> dict[str, float | str]:
-        items = list(self._collect_test_items())
-        if not items:
-            raise ValueError("No test images found for evaluation.")
+        if not self.dataset_names:
+            raise ValueError("dataset_names must contain at least one dataset.")
 
-        per_dataset = {
-            dataset_name: {
+        dataset_metrics = []
+        dataset_count = len(self.dataset_names)
+        for dataset_index, dataset_name in enumerate(self.dataset_names, start=1):
+            progress_label = f"[MVTec {dataset_index}/{dataset_count}][{dataset_name}]"
+            train_paths = list(self._collect_train_images(dataset_name))
+            if not train_paths:
+                raise ValueError(
+                    f"No training images found in: "
+                    f"{self.dataset_root / dataset_name / 'train' / 'good'}"
+                )
+
+            print(f"{progress_label} 訓練開始 ({len(train_paths)}枚)", flush=True)
+            model = self._create_model()
+            normal_images = [self._load_rgb_image(path) for path in train_paths]
+            model.fit(normal_images)
+            del normal_images
+            print(f"{progress_label} 訓練完了", flush=True)
+
+            items = list(self._collect_test_items(dataset_name))
+            if not items:
+                raise ValueError(f"No test images found for dataset: {dataset_name}")
+
+            values = {
                 "image_labels": [],
                 "image_scores": [],
                 "pixel_scores": [],
                 "pixel_labels": [],
                 "pro_examples": [],
             }
-            for dataset_name in self.dataset_names
-        }
+            for item in tqdm(
+                items,
+                desc=f"{progress_label} 推論",
+                unit="枚",
+                dynamic_ncols=True,
+            ):
+                anomaly_map = self._predict_map(model, item["image_path"])
+                image_score = self._aggregate_image_score(anomaly_map)
+                gt_mask = self._load_gt_mask(
+                    item["image_path"],
+                    item["category"],
+                    anomaly_map.shape,
+                    dataset_name,
+                )
 
-        for item in items:
-            anomaly_map = self._predict_map(item["image_path"])
-            image_score = self._aggregate_image_score(anomaly_map)
-            gt_mask = self._load_gt_mask(
-                item["image_path"],
-                item["category"],
-                anomaly_map.shape,
-                item["dataset_name"],
+                values["image_labels"].append(int(item["is_defect"]))
+                values["image_scores"].append(image_score)
+                values["pixel_scores"].append(anomaly_map.ravel())
+                values["pixel_labels"].append(gt_mask.ravel())
+
+                # PRO averages overlap over anomalous regions, but its false-positive
+                # rate is measured over every negative pixel, including good images.
+                values["pro_examples"].append({
+                    "gt_mask": gt_mask,
+                    "scores": anomaly_map,
+                })
+
+            print(f"{progress_label} 評価開始", flush=True)
+            metrics = self._compute_dataset_metrics(dataset_name, values)
+            dataset_metrics.append(metrics)
+            print(
+                f"{progress_label} 評価完了 "
+                f"(image AUROC={metrics['image_auroc']:.4f}, "
+                f"pixel AUROC={metrics['segmentation_auroc']:.4f})",
+                flush=True,
             )
-            dataset_values = per_dataset[item["dataset_name"]]
 
-            dataset_values["image_labels"].append(int(item["is_defect"]))
-            dataset_values["image_scores"].append(image_score)
-            dataset_values["pixel_scores"].append(anomaly_map.ravel())
-            dataset_values["pixel_labels"].append(gt_mask.ravel())
-
-            # PRO averages overlap over anomalous regions, but its false-positive
-            # rate is measured over every negative pixel, including good images.
-            dataset_values["pro_examples"].append({
-                "gt_mask": gt_mask,
-                "scores": anomaly_map,
-            })
-
-        # MVTec metrics are calculated per category and macro-averaged. Pooling
-        # categories would overweight datasets with more images/pixels and would
-        # require anomaly scores to be calibrated across categories.
-        dataset_metrics = [
-            self._compute_dataset_metrics(dataset_name, values)
-            for dataset_name, values in per_dataset.items()
-        ]
+        # MVTec metrics are macro-averaged. Pooling categories would overweight
+        # datasets with more images/pixels and require cross-category calibration.
         image_auroc = float(np.mean([m["image_auroc"] for m in dataset_metrics]))
         image_aupr = float(np.mean([m["image_aupr"] for m in dataset_metrics]))
         segmentation_auroc = float(
@@ -128,8 +171,12 @@ class MVTecEvaluator:
 
         image_labels = np.asarray(values["image_labels"], dtype=np.int32)
         image_scores = np.asarray(values["image_scores"], dtype=np.float64)
-        pixel_scores = np.concatenate(values["pixel_scores"]).astype(np.float64)
-        pixel_labels = np.concatenate(values["pixel_labels"]).astype(np.int32)
+        # Anomaly maps and masks already use compact float32/uint8 dtypes.  Keep
+        # them that way: metric calculation only depends on score ordering and
+        # binary labels, and widening a full MVTec category needlessly allocates
+        # another large pair of arrays.
+        pixel_scores = np.concatenate(values["pixel_scores"])
+        pixel_labels = np.concatenate(values["pixel_labels"])
         return {
             "image_auroc": self._roc_auc(image_labels, image_scores),
             "image_aupr": self._average_precision(image_labels, image_scores),
@@ -140,45 +187,81 @@ class MVTecEvaluator:
             ),
         }
 
-    def _collect_test_items(self) -> Iterable[dict[str, str | bool]]:
-        for dataset_name in self.dataset_names:
-            dataset_dir = self.dataset_root / dataset_name
-            test_dir = dataset_dir / "test"
-            if not test_dir.exists():
-                raise FileNotFoundError(f"test dir not found: {test_dir}")
+    def _create_model(self) -> SubspaceAD:
+        model_kwargs = dict(self.model_kwargs)
+        if "dino" not in model_kwargs and self._shared_dino is not None:
+            model_kwargs["dino"] = self._shared_dino
 
-            for category_dir in sorted(test_dir.iterdir()):
-                if not category_dir.is_dir():
-                    continue
-                category = category_dir.name
-                is_defect = category != "good"
+        # PCA state remains independent because each category gets a fresh
+        # SubspaceAD instance.  The immutable ONNX feature extractor/session is
+        # shared, avoiding an expensive model reload for every category.
+        providers = None if "dino" in model_kwargs else self.providers
+        model = SubspaceAD(
+            str(self.onnx_path),
+            providers=providers,
+            **model_kwargs,
+        )
+        if self._shared_dino is None:
+            self._shared_dino = getattr(model, "dino", None)
+        return model
 
-                for ext in ("*.png", "*.jpg", "*.jpeg", "*.bmp"):
-                    for image_path in sorted(category_dir.glob(ext)):
-                        yield {
-                            "dataset_name": dataset_name,
-                            "category": category,
-                            "image_path": image_path,
-                            "is_defect": is_defect,
-                        }
+    def _collect_train_images(self, dataset_name: str) -> Iterable[Path]:
+        train_dir = self.dataset_root / dataset_name / "train" / "good"
+        if not train_dir.exists():
+            raise FileNotFoundError(f"train/good dir not found: {train_dir}")
+        yield from self._iter_image_files(train_dir)
 
-    def _predict_map(self, image_path: Path) -> np.ndarray:
+    def _collect_test_items(
+        self,
+        dataset_name: str,
+    ) -> Iterable[dict[str, str | bool | Path]]:
+        test_dir = self.dataset_root / dataset_name / "test"
+        if not test_dir.exists():
+            raise FileNotFoundError(f"test dir not found: {test_dir}")
+
+        for category_dir in sorted(test_dir.iterdir()):
+            if not category_dir.is_dir():
+                continue
+            category = category_dir.name
+            is_defect = category != "good"
+
+            for image_path in self._iter_image_files(category_dir):
+                yield {
+                    "dataset_name": dataset_name,
+                    "category": category,
+                    "image_path": image_path,
+                    "is_defect": is_defect,
+                }
+
+    def _iter_image_files(self, directory: Path) -> Iterable[Path]:
+        supported_suffixes = {".png", ".jpg", ".jpeg", ".bmp"}
+        for path in sorted(directory.iterdir()):
+            if path.is_file() and path.suffix.lower() in supported_suffixes:
+                yield path
+
+    def _load_rgb_image(self, image_path: Path) -> np.ndarray:
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f"Unable to read image: {image_path}")
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+    def _predict_map(self, model: object, image_path: Path) -> np.ndarray:
         if self.use_mask_output:
-            if not hasattr(self.model, "predict_mask"):
+            if not hasattr(model, "predict_mask"):
                 raise AttributeError(
                     "model must implement predict_mask(image_path: str, threshold: float) "
                     "when use_mask_output=True"
                 )
-            anomaly_map = self.model.predict_mask(
+            anomaly_map = model.predict_mask(
                 str(image_path),
                 threshold=self.mask_threshold,
             )
         else:
-            if not hasattr(self.model, "predict_anomaly_map"):
+            if not hasattr(model, "predict_anomaly_map"):
                 raise AttributeError(
                     "model must implement predict_anomaly_map(image_path: str) -> np.ndarray"
                 )
-            anomaly_map = self.model.predict_anomaly_map(str(image_path))
+            anomaly_map = model.predict_anomaly_map(str(image_path))
 
         anomaly_map = np.asarray(anomaly_map)
         if anomaly_map.ndim != 2:
@@ -264,8 +347,14 @@ class MVTecEvaluator:
         labels: np.ndarray,
         scores: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        labels = np.asarray(labels, dtype=np.int32).ravel()
-        scores = np.asarray(scores, dtype=np.float64).ravel()
+        labels = np.asarray(labels)
+        if labels.dtype != np.uint8:
+            labels = labels.astype(np.int32)
+        labels = labels.ravel()
+        scores = np.asarray(scores)
+        if scores.dtype != np.float32:
+            scores = scores.astype(np.float64)
+        scores = scores.ravel()
         if labels.size == 0 or labels.size != scores.size:
             raise ValueError("labels and scores must be non-empty and have equal length.")
         if not np.all((labels == 0) | (labels == 1)):
@@ -280,7 +369,10 @@ class MVTecEvaluator:
         scores: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return FP/TP counts at distinct score thresholds, handling ties."""
-        order = np.argsort(scores, kind="mergesort")[::-1]
+        # Tie ordering cannot affect counts sampled at the end of each tie, so
+        # a stable sort is unnecessary.  NumPy's default quicksort is notably
+        # faster for the millions of pixel scores in a MVTec category.
+        order = np.argsort(scores)[::-1]
         sorted_scores = scores[order]
         sorted_labels = labels[order]
         threshold_indices = np.r_[
@@ -304,36 +396,37 @@ class MVTecEvaluator:
             [np.nextafter(max_score, np.inf)],
             np.linspace(max_score, min_score, num=self.pro_num_thresholds),
         ))
-        curve = []
         negative_scores, region_scores = self._prepare_pro_scores(pro_examples)
         total_neg = negative_scores.size
         if total_neg == 0:
             return 0.0
         if not region_scores:
             return 0.0
-        for thr in thresholds:
-            fp = total_neg - np.searchsorted(negative_scores, thr, side="left")
-            fpr = float(fp) / total_neg
-            overlaps = [
-                (scores.size - np.searchsorted(scores, thr, side="left"))
-                / scores.size
-                for scores in region_scores
-            ]
-            pro_value = float(np.mean(overlaps))
-            curve.append((fpr, pro_value))
 
-        curve.sort(key=lambda x: x[0])
+        # searchsorted accepts every threshold at once.  This removes the hot
+        # Python loop over thresholds while evaluating exactly the same points.
+        false_positives = total_neg - np.searchsorted(
+            negative_scores,
+            thresholds,
+            side="left",
+        )
+        fprs = false_positives.astype(np.float64) / total_neg
+        overlap_sums = np.zeros(thresholds.size, dtype=np.float64)
+        for scores in region_scores:
+            overlap_sums += (
+                scores.size
+                - np.searchsorted(scores, thresholds, side="left")
+            ) / scores.size
+        pros = overlap_sums / len(region_scores)
+
         # Several thresholds can have the same FPR. At a vertical segment, the
         # highest attainable PRO is the value relevant for subsequent area.
-        deduplicated = []
-        for fpr, pro in curve:
-            if deduplicated and fpr == deduplicated[-1][0]:
-                deduplicated[-1] = (fpr, max(pro, deduplicated[-1][1]))
-            else:
-                deduplicated.append((fpr, pro))
-
-        fprs = np.asarray([x[0] for x in deduplicated], dtype=np.float64)
-        pros = np.asarray([x[1] for x in deduplicated], dtype=np.float64)
+        # Thresholds decrease monotonically, so FPR and PRO increase
+        # monotonically as well; the final point of each equal-FPR run is its
+        # maximum-PRO point.
+        keep = np.concatenate((fprs[1:] != fprs[:-1], [True]))
+        fprs = fprs[keep]
+        pros = pros[keep]
         limit = self.pro_fpr_limit
         below = fprs < limit
         limited_fprs = np.concatenate((fprs[below], [limit]))
@@ -348,10 +441,14 @@ class MVTecEvaluator:
         negative_scores = []
         region_scores = []
         for example in pro_examples:
-            gt_mask = example["gt_mask"].astype(np.uint8)
+            gt_mask = np.asarray(example["gt_mask"], dtype=np.uint8)
             scores = example["scores"]
             negative_scores.append(scores[gt_mask == 0])
 
+            # Good images contribute negatives but contain no regions.  They
+            # are common in MVTec, so avoid allocating a full label image.
+            if not np.any(gt_mask):
+                continue
             num_labels, labels = cv2.connectedComponents(gt_mask, connectivity=8)
             for region_id in range(1, num_labels):
                 region_scores.append(np.sort(scores[labels == region_id]))
