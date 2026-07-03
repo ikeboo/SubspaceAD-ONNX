@@ -10,7 +10,7 @@ dependencies = [
     "torchvision",
     "transformers",
     "opencv-python",
-    "onnxruntime",
+    "onnxruntime-webgpu",
     "onnxscript",
     "ipykernel",
     "matplotlib",

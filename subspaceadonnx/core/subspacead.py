@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Optional, Iterable, Tuple
+from pathlib import Path
+from typing import Callable, Optional, Iterable, Tuple
 from tqdm import tqdm
 import cv2
 import numpy as np
@@ -12,7 +13,7 @@ import numpy as np
 
 # 既存のDINOv3 ONNXラッパーを使う想定
 # 例:
-from dinov3_onnx import DINOv3
+from .dinov3_onnx import DINOv3
 
 
 class SubspaceAD:
@@ -499,6 +500,66 @@ class SubspaceAD:
             "fit_max_score": self.fit_max_score_,
             "score_scale": self.score_scale_,
         }
+
+    def predict_anomaly_map(
+        self,
+        image_path: str,
+        output_size: Optional[Tuple[int, int]] = None,
+        normalize_map: Optional[bool] = None,
+    ) -> np.ndarray:
+        """
+        Reads an image from disk and returns the anomaly map.
+
+        Args:
+            image_path: Path to the image file.
+            output_size: Size of the output anomaly map / mask (height, width).
+            normalize_map: Whether to apply per-image min-max normalization.
+                If None, self.normalize_map is used.
+
+        Returns:
+            anomaly_map: Floating point anomaly map of shape [H, W].
+        """
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(f"image_path not found: {image_path}")
+
+        img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError(f"Unable to read image: {image_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        return self(
+            img,
+            output_size=output_size,
+            normalize_map=normalize_map,
+        )
+
+    def predict_mask(
+        self,
+        image_path: str,
+        threshold: float = 0.5,
+        output_size: Optional[Tuple[int, int]] = None,
+        normalize_map: Optional[bool] = True,
+    ) -> np.ndarray:
+        """
+        Reads an image from disk, computes the anomaly map, and returns a binary mask.
+
+        Args:
+            image_path: Path to the image file.
+            threshold: Threshold applied to the anomaly map.
+            output_size: Size of the output anomaly map / mask (height, width).
+            normalize_map: Whether to apply per-image min-max normalization.
+                If None, self.normalize_map is used.
+
+        Returns:
+            mask: Binary mask of shape [H, W], dtype uint8, values 0/255.
+        """
+        anomaly_map = self.predict_anomaly_map(
+            image_path,
+            output_size=output_size,
+            normalize_map=normalize_map,
+        )
+        return (anomaly_map >= threshold).astype(np.uint8) * 255
 
     def load_state_dict(self, state: dict) -> None:
         """

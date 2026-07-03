@@ -79,6 +79,37 @@ plt.show()
 
 `anomaly_map` is a `float32` array with the same height and width as the input image. Higher values indicate more anomalous regions.
 
+## Image mask prediction
+
+You can also predict a binary anomaly mask directly from an image path:
+
+```python
+mask = model.predict_mask("data/test/sample.png", threshold=0.5)
+```
+
+## MVTec evaluation
+
+Use `MVTecEvaluator` to evaluate MVTec-style datasets and append results to `results.csv` at the dataset root:
+
+```python
+from mvtec_evaluation import MVTecEvaluator
+
+evaluator = MVTecEvaluator(
+    dataset_root="datasets",
+    dataset_names=["leather"],
+    description="SubspaceAD DINOv3 evaluation",
+    model=model,
+)
+result = evaluator.evaluate()
+print(result)
+```
+
+For evaluation, keep `normalize_map=False` (the default). AUROC and average
+precision use score ordering, while AU-PRO sweeps thresholds over the shared
+raw score range, so per-image min-max normalization is unnecessary and can
+distort comparisons between images. `segmentation_pro` is normalized AU-PRO
+up to FPR 0.3 by default.
+
 See [inference.ipynb](inference.ipynb) for additional visualization and examples of saving and restoring the PCA parameters.
 
 ## Project files

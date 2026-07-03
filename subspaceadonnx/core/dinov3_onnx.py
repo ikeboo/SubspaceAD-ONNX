@@ -54,7 +54,7 @@ class DINOv3:
         self.std = np.asarray(std, dtype=np.float32).reshape(1, 1, 3)
 
         if providers is None:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            providers = ["CUDAExecutionProvider","WebGpuExecutionProvider", "CPUExecutionProvider"]
 
         available = ort.get_available_providers()
         providers = [p for p in providers if p in available]
