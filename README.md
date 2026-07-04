@@ -64,6 +64,15 @@ model = SubspaceAD(
 )
 model.fit(normal_images)
 
+# A directory can be passed instead; supported images are loaded recursively
+# model.fit("data/train/good")
+
+# Save and restore the fitted PCA state (the ONNX model is not duplicated)
+model.save_npz("models/pca_params.npz")
+
+restored_model = SubspaceAD("models/dinov3_vitb_middle7.onnx")
+restored_model.load_npz("models/pca_params.npz")
+
 # Run inference
 target_image = read_rgb("data/test/sample.png")
 anomaly_map = model(target_image)
@@ -90,7 +99,7 @@ mask = model.predict_mask("data/test/sample.png", threshold=0.5)
 
 ## MVTec evaluation
 
-Use `MVTecEvaluator` to evaluate MVTec-style datasets and append results to `results.csv` at the dataset root:
+Use `MVTecEvaluator` to evaluate MVTec-style datasets and append results to a CSV file. By default, it writes to `results.csv` at the dataset root:
 
 ```python
 from subspaceadonnx import MVTecEvaluator
@@ -99,6 +108,7 @@ evaluator = MVTecEvaluator(
     dataset_root="datasets",
     dataset_names=["leather"],
     onnx_path="models/dinov3_vitb_middle7.onnx",
+    result_path="outputs/mvtec_results.csv",
     providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
 )
 result = evaluator.evaluate()
@@ -107,8 +117,13 @@ print(result)
 
 For each dataset category, the evaluator trains a new `SubspaceAD` model with
 the images under `train/good`, runs inference on all images under `test`, and
-then calculates the metrics. Training, inference (`n/N` images), and evaluation
-status are displayed while it runs. To customize `SubspaceAD`, pass its keyword
+then calculates the metrics. Each category is written as a separate CSV row,
+followed by a macro-average row whose `datasets` value is `average`. Metric
+values use five decimal places, and `description` is the last column. The
+average row appends the evaluated categories to its description, for example
+`dinov3_vitb_middle7;leather;screw`.
+Training, inference (`n/N` images), and evaluation status are displayed while
+it runs. To customize `SubspaceAD`, pass its keyword
 arguments through `model_kwargs`, for example `model_kwargs={"pca_ev": 0.95}`.
 The same `providers` argument can also be passed directly to `SubspaceAD` and
 `DINOv3`. Providers are tried in the given priority order.

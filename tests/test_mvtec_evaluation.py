@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import io
 import tempfile
 import unittest
@@ -264,10 +265,12 @@ class MVTecEvaluationFlowTests(unittest.TestCase):
             raise RuntimeError(f"Unable to create test image: {path}")
 
     def test_trains_a_separate_model_and_reports_progress_per_dataset(self) -> None:
+        result_path = self.root / "output" / "evaluation.csv"
         evaluator = MVTecEvaluator(
             dataset_root=str(self.root),
             dataset_names=["leather", "tile"],
             onnx_path=str(self.onnx_path),
+            result_path=result_path,
         )
         models = [FakeModel(), FakeModel()]
 
@@ -279,17 +282,78 @@ class MVTecEvaluationFlowTests(unittest.TestCase):
 
         self.assertEqual(result["description"], "feature_extractor")
         self.assertEqual(result["datasets"], "leather;tile")
-        self.assertEqual(result["image_auroc"], 1.0)
+        self.assertEqual(result["img_auroc"], 1.0)
         self.assertEqual(len(models), 2)
         self.assertTrue(all(model.fit_images is not None for model in models))
         self.assertTrue(all(len(model.fit_images) == 1 for model in models))
 
         output = stdout.getvalue() + stderr.getvalue()
-        self.assertIn("[MVTec 1/2][leather] 訓練開始", output)
-        self.assertIn("[MVTec 1/2][leather] 推論", output)
-        self.assertIn("[MVTec 1/2][leather] 評価完了", output)
-        self.assertIn("[MVTec 2/2][tile] 訓練開始", output)
-        self.assertTrue((self.root / "results.csv").exists())
+        self.assertIn("[MVTec 1/2][leather] Start fitting", output)
+        self.assertIn("[MVTec 1/2][leather] Inference", output)
+        self.assertIn("[MVTec 1/2][leather] Evaluation completed", output)
+        self.assertIn("[MVTec 2/2][tile] Start fitting", output)
+        self.assertTrue(result_path.exists())
+        self.assertFalse((self.root / "results.csv").exists())
+        with result_path.open(newline="", encoding="utf-8") as csvfile:
+            rows = list(csv.DictReader(csvfile))
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(
+            [row["datasets"] for row in rows],
+            ["leather", "tile", "average"],
+        )
+        self.assertEqual(
+            list(rows[0]),
+            [
+                "date",
+                "datasets",
+                "img_auroc",
+                "img_aupr",
+                "seg_auroc",
+                "seg_pro",
+                "description",
+            ],
+        )
+        self.assertEqual(rows[0]["img_auroc"], "1.00000")
+        self.assertEqual(rows[0]["seg_pro"], "1.00000")
+        self.assertEqual(rows[0]["description"], "feature_extractor")
+        self.assertEqual(rows[2]["img_auroc"], "1.00000")
+        self.assertEqual(
+            rows[2]["description"],
+            "feature_extractor;leather;tile",
+        )
+
+    def test_existing_csv_is_migrated_to_the_new_column_order(self) -> None:
+        result_path = self.root / "results.csv"
+        result_path.write_text(
+            "date,description,datasets,img_auroc,img_aupr,seg_auroc,seg_pro\n"
+            "2026-07-03 10:00:00,old model,leather,1.0,0.9,0.8,0.7\n",
+            encoding="utf-8",
+        )
+        evaluator = MVTecEvaluator(
+            dataset_root=str(self.root),
+            dataset_names=["tile"],
+            onnx_path=str(self.onnx_path),
+            result_path=result_path,
+        )
+
+        evaluator._append_results([{
+            "date": "2026-07-04 10:00:00",
+            "datasets": "tile",
+            "img_auroc": 0.123456,
+            "img_aupr": 0.234567,
+            "seg_auroc": 0.345678,
+            "seg_pro": 0.456789,
+            "description": "new model",
+        }])
+
+        with result_path.open(newline="", encoding="utf-8") as csvfile:
+            rows = list(csv.DictReader(csvfile))
+
+        self.assertEqual(list(rows[0])[-1], "description")
+        self.assertEqual(rows[0]["img_aupr"], "0.90000")
+        self.assertEqual(rows[0]["description"], "old model")
+        self.assertEqual(rows[1]["img_auroc"], "0.12346")
 
     def test_model_kwargs_are_forwarded_to_subspacead(self) -> None:
         evaluator = MVTecEvaluator(

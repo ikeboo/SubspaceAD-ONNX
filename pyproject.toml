@@ -13,6 +13,7 @@ dependencies = [
     "onnxruntime-webgpu",
     "onnxscript",
     "ipykernel",
+    "ipywidgets",
     "matplotlib",
     "tqdm"
 ]

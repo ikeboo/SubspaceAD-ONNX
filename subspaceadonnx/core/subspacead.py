@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import math
 import warnings
 from pathlib import Path
 from typing import Callable, Optional, Iterable, Tuple
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import cv2
 import numpy as np
 
@@ -34,6 +35,18 @@ class SubspaceAD:
         [H_patch, W_patch, C]
         [1, H_patch, W_patch, C]
     """
+
+    IMAGE_EXTENSIONS = frozenset(
+        {
+            ".bmp",
+            ".jpeg",
+            ".jpg",
+            ".png",
+            ".tif",
+            ".tiff",
+            ".webp",
+        }
+    )
 
     def __init__(
         self,
@@ -117,25 +130,30 @@ class SubspaceAD:
         self.fit_max_score_: Optional[float] = None
         self.score_scale_: float = 1.0
 
-    def fit(self, imgs: list[np.ndarray]) -> "SubspaceAD":
+    def fit(self, imgs: list[np.ndarray] | str | Path) -> "SubspaceAD":
         """
-        正常画像リストから正常部分空間を作成する。
+        正常画像リストまたはディレクトリから正常部分空間を作成する。
 
         Args:
             imgs:
-                正常画像のlist。各要素は np.ndarray。
-                DINOv3ラッパーが受け付ける形式に合わせてください。
+                正常画像のlist、または正常画像を含むディレクトリ。
+                listの各要素は np.ndarray で、DINOv3ラッパーが受け付ける
+                形式に合わせてください。ディレクトリの場合は配下を再帰的に
+                探索し、対応する画像ファイルをRGBで読み込みます。
 
         Returns:
             self
         """
+        if isinstance(imgs, (str, Path)):
+            imgs = self.load_images_from_directory(imgs)
+
         if len(imgs) == 0:
             raise ValueError("fitには少なくとも1枚の正常画像が必要です。")
 
         all_features = []
         extracted = []
 
-        for img in tqdm(imgs, desc="Extracting features"):
+        for img in tqdm(imgs, desc="Extracting features",unit="images"):
             feat, grid_size = self._extract_patch_features(img)
             all_features.append(feat)
             extracted.append((feat, grid_size, img.shape[:2]))
@@ -150,6 +168,47 @@ class SubspaceAD:
         self._fit_pca(X)
         self._fit_score_scale(extracted)
         return self
+
+    @classmethod
+    def load_images_from_directory(
+        cls,
+        directory_path: str | Path,
+    ) -> list[np.ndarray]:
+        """ディレクトリ配下の対応画像ファイルをRGBで読み込む。
+
+        サブディレクトリも再帰的に探索し、パス順に読み込みます。画像以外の
+        ファイルは無視します。
+
+        Args:
+            directory_path: 画像を含むディレクトリ。
+
+        Returns:
+            RGB画像のlist。
+        """
+        directory = Path(directory_path)
+        if not directory.exists():
+            raise FileNotFoundError(f"image directory not found: {directory}")
+        if not directory.is_dir():
+            raise NotADirectoryError(
+                f"image directory is not a directory: {directory}"
+            )
+
+        image_paths = sorted(
+            path
+            for path in directory.rglob("*")
+            if path.is_file() and path.suffix.lower() in cls.IMAGE_EXTENSIONS
+        )
+        if not image_paths:
+            raise ValueError(f"No supported image files found in: {directory}")
+
+        images = []
+        for image_path in image_paths:
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"Unable to read image: {image_path}")
+            images.append(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+        return images
 
     def __call__(
         self,
@@ -211,6 +270,7 @@ class SubspaceAD:
         for feat, grid_size, output_size in tqdm(
             extracted,
             desc="Calibrating anomaly-map scale",
+            unit="images"
         ):
             scores = self._score_features(feat)
             anomaly_map = self._scores_to_map(scores, grid_size, output_size)
@@ -511,6 +571,87 @@ class SubspaceAD:
             "fit_max_score": self.fit_max_score_,
             "score_scale": self.score_scale_,
         }
+
+    def save_npz(self, npz_path: str | Path) -> None:
+        """Save the fitted PCA state and inference settings to an NPZ file.
+
+        The DINOv3 model itself is not included.  Metadata is stored as JSON so
+        that the resulting file can be loaded without enabling pickle support.
+
+        Args:
+            npz_path: Destination path. ``.npz`` is appended by NumPy when the
+                supplied path does not already end with that suffix.
+        """
+        state = self.state_dict()
+        metadata = {
+            "format_version": 1,
+            "model_name": str(state["model_name"]),
+            "pca_ev": (
+                None if state["pca_ev"] is None else float(state["pca_ev"])
+            ),
+            "pca_dim": (
+                None if state["pca_dim"] is None else int(state["pca_dim"])
+            ),
+            "feature_l2_normalize": bool(state["feature_l2_normalize"]),
+            "normalize_map": bool(state["normalize_map"]),
+            "calibration_target": float(state["calibration_target"]),
+            "blur": bool(state["blur"]),
+            "eps": float(state["eps"]),
+            "n_components": int(state["n_components"]),
+            "feature_dim": int(state["feature_dim"]),
+            "fit_max_score": float(state["fit_max_score"]),
+            "score_scale": float(state["score_scale"]),
+        }
+        np.savez_compressed(
+            npz_path,
+            metadata=np.asarray(json.dumps(metadata)),
+            mean=state["mean"],
+            components=state["components"],
+            eigvals=state["eigvals"],
+        )
+
+    def load_npz(self, npz_path: str | Path) -> "SubspaceAD":
+        """Load PCA state and inference settings saved by :meth:`save_npz`.
+
+        The current DINOv3 instance is retained, so it must be compatible with
+        the feature dimension of the model used when fitting.
+
+        Args:
+            npz_path: Path to an NPZ file created by :meth:`save_npz`.
+
+        Returns:
+            self
+        """
+        required_keys = {"metadata", "mean", "components", "eigvals"}
+        with np.load(npz_path, allow_pickle=False) as saved:
+            missing_keys = required_keys.difference(saved.files)
+            if missing_keys:
+                missing = ", ".join(sorted(missing_keys))
+                raise ValueError(f"Invalid SubspaceAD NPZ: missing keys: {missing}")
+
+            try:
+                metadata = json.loads(str(saved["metadata"].item()))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise ValueError("Invalid SubspaceAD NPZ metadata.") from exc
+
+            if not isinstance(metadata, dict):
+                raise ValueError("Invalid SubspaceAD NPZ metadata.")
+
+            if metadata.get("format_version") != 1:
+                raise ValueError(
+                    "Unsupported SubspaceAD NPZ format version: "
+                    f"{metadata.get('format_version')!r}"
+                )
+
+            state = {
+                **metadata,
+                "mean": np.array(saved["mean"], copy=True),
+                "components": np.array(saved["components"], copy=True),
+                "eigvals": np.array(saved["eigvals"], copy=True),
+            }
+
+        self.load_state_dict(state)
+        return self
 
     def predict_anomaly_map(
         self,

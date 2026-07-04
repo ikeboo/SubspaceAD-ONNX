@@ -36,7 +36,8 @@ class MVTecEvaluator:
         mask_threshold: float = 0.5,
         pro_fpr_limit: float = 0.3,
         pro_num_thresholds: int = 200,
-        results_filename: str = "results.csv",
+        result_path: str | Path | None = None,
+        results_filename: str | None = None,
     ):
         self.dataset_root = Path(dataset_root)
         self.dataset_names = dataset_names
@@ -49,7 +50,12 @@ class MVTecEvaluator:
         self.mask_threshold = mask_threshold
         self.pro_fpr_limit = float(pro_fpr_limit)
         self.pro_num_thresholds = int(pro_num_thresholds)
-        self.results_path = self.dataset_root / results_filename
+        if result_path is not None and results_filename is not None:
+            raise ValueError("Pass either result_path or results_filename, not both.")
+        if result_path is not None:
+            self.result_path = Path(result_path)
+        else:
+            self.result_path = self.dataset_root / (results_filename or "results.csv")
         self._shared_dino: object | None = None
 
         if not self.dataset_root.exists():
@@ -82,12 +88,12 @@ class MVTecEvaluator:
                     f"{self.dataset_root / dataset_name / 'train' / 'good'}"
                 )
 
-            print(f"{progress_label} 訓練開始 ({len(train_paths)}枚)", flush=True)
+            print(f"{progress_label} Start fitting ({len(train_paths)}imgs)", flush=True)
             model = self._create_model()
             normal_images = [self._load_rgb_image(path) for path in train_paths]
             model.fit(normal_images)
             del normal_images
-            print(f"{progress_label} 訓練完了", flush=True)
+            print(f"{progress_label} Training completed", flush=True)
 
             items = list(self._collect_test_items(dataset_name))
             if not items:
@@ -102,8 +108,8 @@ class MVTecEvaluator:
             }
             for item in tqdm(
                 items,
-                desc=f"{progress_label} 推論",
-                unit="枚",
+                desc=f"{progress_label} Inference",
+                unit="images",
                 dynamic_ncols=True,
             ):
                 anomaly_map = self._predict_map(model, item["image_path"])
@@ -127,38 +133,57 @@ class MVTecEvaluator:
                     "scores": anomaly_map,
                 })
 
-            print(f"{progress_label} 評価開始", flush=True)
+            print(f"{progress_label} Start evaluation", flush=True)
             metrics = self._compute_dataset_metrics(dataset_name, values)
             dataset_metrics.append(metrics)
             print(
-                f"{progress_label} 評価完了 "
-                f"(image AUROC={metrics['image_auroc']:.4f}, "
-                f"pixel AUROC={metrics['segmentation_auroc']:.4f})",
+                f"{progress_label} Evaluation completed "
+                f"(image AUROC={metrics['img_auroc']:.4f}, "
+                f"pixel AUROC={metrics['seg_auroc']:.4f})",
                 flush=True,
             )
 
         # MVTec metrics are macro-averaged. Pooling categories would overweight
         # datasets with more images/pixels and require cross-category calibration.
-        image_auroc = float(np.mean([m["image_auroc"] for m in dataset_metrics]))
-        image_aupr = float(np.mean([m["image_aupr"] for m in dataset_metrics]))
-        segmentation_auroc = float(
-            np.mean([m["segmentation_auroc"] for m in dataset_metrics])
+        img_auroc = float(np.mean([m["img_auroc"] for m in dataset_metrics]))
+        img_aupr = float(np.mean([m["img_aupr"] for m in dataset_metrics]))
+        seg_auroc = float(
+            np.mean([m["seg_auroc"] for m in dataset_metrics])
         )
-        segmentation_pro = float(
-            np.mean([m["segmentation_pro"] for m in dataset_metrics])
+        seg_pro = float(
+            np.mean([m["seg_pro"] for m in dataset_metrics])
         )
 
+        evaluated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         result = {
-            "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "date": evaluated_at,
             "description": self.description,
             "datasets": ";".join(self.dataset_names),
-            "image_auroc": float(image_auroc),
-            "image_aupr": float(image_aupr),
-            "segmentation_auroc": float(segmentation_auroc),
-            "segmentation_pro": float(segmentation_pro),
+            "img_auroc": float(img_auroc),
+            "img_aupr": float(img_aupr),
+            "seg_auroc": float(seg_auroc),
+            "seg_pro": float(seg_pro),
         }
 
-        self._append_results(result)
+        dataset_results = [
+            {
+                "date": evaluated_at,
+                "datasets": dataset_name,
+                **metrics,
+                "description": self.description,
+            }
+            for dataset_name, metrics in zip(self.dataset_names, dataset_metrics)
+        ]
+        dataset_results.append({
+            "date": evaluated_at,
+            "datasets": "average",
+            "img_auroc": img_auroc,
+            "img_aupr": img_aupr,
+            "seg_auroc": seg_auroc,
+            "seg_pro": seg_pro,
+            "description": ";".join([self.description, *self.dataset_names]),
+        })
+        self._append_results(dataset_results)
         return result
 
     def _compute_dataset_metrics(
@@ -178,10 +203,10 @@ class MVTecEvaluator:
         pixel_scores = np.concatenate(values["pixel_scores"])
         pixel_labels = np.concatenate(values["pixel_labels"])
         return {
-            "image_auroc": self._roc_auc(image_labels, image_scores),
-            "image_aupr": self._average_precision(image_labels, image_scores),
-            "segmentation_auroc": self._roc_auc(pixel_labels, pixel_scores),
-            "segmentation_pro": self._pro_auc(
+            "img_auroc": self._roc_auc(image_labels, image_scores),
+            "img_aupr": self._average_precision(image_labels, image_scores),
+            "seg_auroc": self._roc_auc(pixel_labels, pixel_scores),
+            "seg_pro": self._pro_auc(
                 values["pro_examples"],
                 pixel_scores,
             ),
@@ -487,20 +512,58 @@ class MVTecEvaluator:
                 total_regions += 1
         return float(total_overlap / total_regions) if total_regions > 0 else 0.0
 
-    def _append_results(self, result: dict[str, float | str]) -> None:
+    def _append_results(self, results: Iterable[dict[str, float | str]]) -> None:
         fieldnames = [
             "date",
-            "description",
             "datasets",
-            "image_auroc",
-            "image_aupr",
-            "segmentation_auroc",
-            "segmentation_pro",
+            "img_auroc",
+            "img_aupr",
+            "seg_auroc",
+            "seg_pro",
+            "description",
         ]
-        write_header = not self.results_path.exists()
-        self.results_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.results_path, mode="a", newline="", encoding="utf-8") as csvfile:
+        self.result_path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not self.result_path.exists() or self.result_path.stat().st_size == 0
+        if not write_header:
+            with open(self.result_path, newline="", encoding="utf-8") as csvfile:
+                reader = csv.DictReader(csvfile)
+                existing_fieldnames = reader.fieldnames
+                existing_results = list(reader)
+
+            if existing_fieldnames != fieldnames:
+                if set(existing_fieldnames or []) != set(fieldnames):
+                    raise ValueError(
+                        f"Unexpected CSV columns in {self.result_path}: "
+                        f"{existing_fieldnames}"
+                    )
+                with open(
+                    self.result_path,
+                    mode="w",
+                    newline="",
+                    encoding="utf-8",
+                ) as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(
+                        self._format_result(result) for result in existing_results
+                    )
+
+        with open(self.result_path, mode="a", newline="", encoding="utf-8") as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             if write_header:
                 writer.writeheader()
-            writer.writerow(result)
+            for result in results:
+                writer.writerow(self._format_result(result))
+
+    @staticmethod
+    def _format_result(result: dict[str, float | str]) -> dict[str, float | str]:
+        metric_names = {
+            "img_auroc",
+            "img_aupr",
+            "seg_auroc",
+            "seg_pro",
+        }
+        return {
+            key: f"{float(value):.5f}" if key in metric_names else value
+            for key, value in result.items()
+        }
