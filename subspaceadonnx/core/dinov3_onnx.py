@@ -115,8 +115,8 @@ class DINOv3:
         """
         Args:
             img:
-                RGB or BGRのHWC画像。
-                既存pipelineに合わせて必要ならRGB/BGRを調整してください。
+                OpenCV形式のBGR HWC画像。RGBへの変換はこのpreprocess内で
+                行います。
 
         Returns:
             pixel_values:
@@ -125,12 +125,10 @@ class DINOv3:
         if img.ndim != 3 or img.shape[2] != 3:
             raise ValueError(f"img must be HWC 3ch image, got {img.shape}")
 
-        # ここでは入力をRGB想定にしています。
-        # OpenCVで読んだBGR画像を渡す場合は、呼び出し前に
-        # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # してください。
+        # 公開入力はOpenCV BGR、DINOv3/ONNXの正規化入力はRGB。
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         x = cv2.resize(
-            img,
+            rgb,
             (self.width, self.height),
             interpolation=cv2.INTER_AREA,
         )

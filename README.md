@@ -26,6 +26,11 @@ models/dinov3_vitb_middle7.onnx
 models/dinov3_vitb_middle7.json
 ```
 
+The exporter returns the CLS token from the last selected feature layer. This
+allows ONNX to prune later transformer blocks that do not contribute to the
+patch features used by SubspaceAD. Re-export an older model to get the smaller,
+faster graph; patch-token values are unchanged.
+
 You can specify a different image size or set of intermediate layers:
 
 ```bash
@@ -45,18 +50,18 @@ from glob import glob
 import cv2
 import matplotlib.pyplot as plt
 
-from subspacead_onnx import SubspaceAD
+from subspaceadonnx import SubspaceAD
 
 
-def read_rgb(path: str):
+def read_bgr(path: str):
     image = cv2.imread(path)
     if image is None:
         raise FileNotFoundError(path)
-    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return image
 
 
 # Fit the model using normal images only
-normal_images = [read_rgb(path) for path in glob("data/train/good/*.png")]
+normal_images = [read_bgr(path) for path in sorted(glob("data/train/good/*.png"))]
 
 model = SubspaceAD(
     "models/dinov3_vitb_middle7.onnx",
@@ -74,13 +79,15 @@ restored_model = SubspaceAD("models/dinov3_vitb_middle7.onnx")
 restored_model.load_npz("models/pca_params.npz")
 
 # Run inference
-target_image = read_rgb("data/test/sample.png")
+target_image = read_bgr("data/test/sample.png")
 anomaly_map = model(target_image)
-image_score = model.image_score(target_image)
+image_score = float(anomaly_map.max())
 
 print(f"image score: {image_score:.4f}")
+print(f"pixel threshold: {model.threshold_:.4f}")
+print(f"image threshold: {model.image_threshold_:.4f}")
 
-plt.imshow(target_image)
+plt.imshow(cv2.cvtColor(target_image, cv2.COLOR_BGR2RGB))
 plt.imshow(anomaly_map, cmap="jet", alpha=0.5, vmin=0, vmax=1)
 plt.colorbar(label="anomaly score")
 plt.axis("off")
@@ -89,13 +96,41 @@ plt.show()
 
 `anomaly_map` is a `float32` array with the same height and width as the input image. Higher values indicate more anomalous regions.
 
+`SubspaceAD` accepts OpenCV BGR arrays by default and forwards them unchanged to
+`DINOv3`. `DINOv3.preprocess` performs the BGR-to-RGB conversion immediately
+before resizing and normalization. Direct ndarray inputs must therefore also be
+OpenCV-style BGR arrays.
+
+By default, PCA is fitted after subtracting the normal mean at each patch
+position (`spatial_centering=1.0`). Only one mean vector per position is saved;
+training features are not retained as a memory bank. Inference uses the
+orthogonal-projection identity for the squared residual and applies a logarithmic
+transform relative to the learned median normal SPE. A lower normal-score offset
+is subtracted before scaling, so normal maps retain useful contrast while their
+training maximum remains 0.5. A normal holdout split learns separate pixel and
+image thresholds. The legacy global-PCA behavior remains available:
+
+```python
+legacy_model = SubspaceAD(
+    "models/dinov3_vitb_middle7.onnx",
+    spatial_centering=0.0,
+    score_transform="squared",
+)
+```
+
+`score_transform` also accepts `"sqrt"`. Version-3 NPZ files persist the learned
+reference, offset and thresholds. Version-1/2 files remain loadable
+with their legacy scoring behavior.
+
 ## Image mask prediction
 
 You can also predict a binary anomaly mask directly from an image path:
 
 ```python
-mask = model.predict_mask("data/test/sample.png", threshold=0.5)
+mask = model.predict_mask("data/test/sample.png")
 ```
+
+Omitting `threshold` uses `model.threshold_`, learned from holdout normal pixels.
 
 ## MVTec evaluation
 
@@ -115,6 +150,9 @@ result = evaluator.evaluate()
 print(result)
 ```
 
+Pass `save_hist=True` to `evaluate` to save each dataset's good/abnormal
+image-score histogram as `{dataset_name}_hist.png` at the dataset root.
+
 For each dataset category, the evaluator trains a new `SubspaceAD` model with
 the images under `train/good`, runs inference on all images under `test`, and
 then calculates the metrics. Each category is written as a separate CSV row,
@@ -133,6 +171,24 @@ precision use score ordering, while AU-PRO sweeps thresholds over the shared
 raw score range, so per-image min-max normalization is unnecessary and can
 distort comparisons between images. `segmentation_pro` is normalized AU-PRO
 up to FPR 0.3 by default.
+
+On the 11 MVTec categories included in this repository, using the 224px
+DINOv3-ViT-S+ Middle-7 model gave the following macro averages:
+
+| Method | Image AUROC | Image AUPR | Pixel AUROC | AU-PRO | Evaluation time |
+|---|---:|---:|---:|---:|---:|
+| Global PCA + squared SPE | 0.95421 | 0.97498 | 0.97650 | 0.91787 | 268.1s |
+| Spatial PCA + legacy log-SPE | **0.95903** | **0.97952** | **0.98018** | 0.92446 | 263.7s |
+| Spatial PCA + calibrated log-SPE (current) | 0.95875 | 0.97908 | 0.98015 | **0.92493** | **255.9s** |
+
+The calibrated version fixes anomaly-map contrast and learns usable operating
+thresholds; its four macro metrics remain above the original global-PCA
+baseline. Per-category results are in
+[`outputs/calibrated_v3_224.csv`](outputs/calibrated_v3_224.csv).
+
+The pruned 224px export produced identical patch tokens in a direct comparison,
+reduced the graph from 704 to 535 nodes and feature-extraction latency from
+22.18ms to 17.97ms on CPU (100-image warm benchmark).
 
 See [inference.ipynb](inference.ipynb) for additional visualization and examples of saving and restoring the PCA parameters.
 

@@ -73,7 +73,7 @@ class MVTecEvaluator:
         if self.pro_num_thresholds < 2:
             raise ValueError("pro_num_thresholds must be at least 2.")
 
-    def evaluate(self) -> dict[str, float | str]:
+    def evaluate(self, save_hist: bool = False) -> dict[str, float | str]:
         if not self.dataset_names:
             raise ValueError("dataset_names must contain at least one dataset.")
 
@@ -90,7 +90,7 @@ class MVTecEvaluator:
 
             print(f"{progress_label} Start fitting ({len(train_paths)}imgs)", flush=True)
             model = self._create_model()
-            normal_images = [self._load_rgb_image(path) for path in train_paths]
+            normal_images = [self._load_bgr_image(path) for path in train_paths]
             model.fit(normal_images)
             del normal_images
             print(f"{progress_label} Training completed", flush=True)
@@ -132,6 +132,13 @@ class MVTecEvaluator:
                     "gt_mask": gt_mask,
                     "scores": anomaly_map,
                 })
+
+            if save_hist:
+                self._save_image_score_histogram(
+                    dataset_name,
+                    values["image_labels"],
+                    values["image_scores"],
+                )
 
             print(f"{progress_label} Start evaluation", flush=True)
             metrics = self._compute_dataset_metrics(dataset_name, values)
@@ -212,6 +219,44 @@ class MVTecEvaluator:
             ),
         }
 
+    def _save_image_score_histogram(
+        self,
+        dataset_name: str,
+        image_labels: list[int],
+        image_scores: list[float],
+    ) -> None:
+        import matplotlib.pyplot as plt
+
+        labels = np.asarray(image_labels, dtype=np.int32)
+        scores = np.clip(np.asarray(image_scores, dtype=np.float64), 0.0, 1.0)
+        bins = np.linspace(0.0, 1.0, num=21)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        try:
+            ax.hist(
+                (scores[labels == 0], scores[labels == 1]),
+                bins=bins,
+                label=("good", "abnormal"),
+                color=("tab:blue", "tab:orange"),
+                histtype="stepfilled",
+                alpha=0.5,
+                linewidth=1.5,
+            )
+            ax.set_xlim(0.0, 1.0)
+            ax.set_xticks(bins)
+            ax.set_xlabel("Image anomaly score")
+            ax.set_ylabel("Number of images")
+            ax.set_title(f"{dataset_name} image-level anomaly score distribution")
+            ax.grid(axis="y", alpha=0.25)
+            ax.legend()
+            fig.tight_layout()
+            fig.savefig(
+                self.dataset_root / f"{dataset_name}_hist.png",
+                dpi=150,
+            )
+        finally:
+            plt.close(fig)
+
     def _create_model(self) -> SubspaceAD:
         model_kwargs = dict(self.model_kwargs)
         if "dino" not in model_kwargs and self._shared_dino is not None:
@@ -264,11 +309,12 @@ class MVTecEvaluator:
             if path.is_file() and path.suffix.lower() in supported_suffixes:
                 yield path
 
-    def _load_rgb_image(self, image_path: Path) -> np.ndarray:
+    def _load_bgr_image(self, image_path: Path) -> np.ndarray:
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"Unable to read image: {image_path}")
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # SubspaceAD/DINOv3へOpenCV BGRのまま渡す。
+        return image
 
     def _predict_map(self, model: object, image_path: Path) -> np.ndarray:
         if self.use_mask_output:

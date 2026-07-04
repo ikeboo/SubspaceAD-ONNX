@@ -323,6 +323,47 @@ class MVTecEvaluationFlowTests(unittest.TestCase):
             "feature_extractor;leather;tile",
         )
 
+    def test_save_hist_writes_good_and_abnormal_image_score_histograms(self) -> None:
+        evaluator = MVTecEvaluator(
+            dataset_root=str(self.root),
+            dataset_names=["leather"],
+            onnx_path=str(self.onnx_path),
+        )
+
+        with patch.object(evaluator, "_create_model", return_value=FakeModel()):
+            evaluator.evaluate(save_hist=True)
+
+        hist_path = self.root / "leather_hist.png"
+        self.assertTrue(hist_path.exists())
+        self.assertIsNotNone(cv2.imread(str(hist_path), cv2.IMREAD_COLOR))
+
+    def test_histogram_clips_scores_to_range_and_uses_005_bins(self) -> None:
+        import matplotlib.pyplot  # noqa: F401
+
+        evaluator = MVTecEvaluator(
+            dataset_root=str(self.root),
+            dataset_names=["leather"],
+            onnx_path=str(self.onnx_path),
+        )
+
+        with patch("matplotlib.axes.Axes.hist") as hist, \
+                patch("matplotlib.axes.Axes.legend"):
+            evaluator._save_image_score_histogram(
+                "leather",
+                image_labels=[0, 0, 1, 1],
+                image_scores=[-0.2, 0.25, 0.75, 1.8],
+            )
+
+        plotted_scores = hist.call_args.args[0]
+        np.testing.assert_array_equal(plotted_scores[0], [0.0, 0.25])
+        np.testing.assert_array_equal(plotted_scores[1], [0.75, 1.0])
+        np.testing.assert_allclose(
+            hist.call_args.kwargs["bins"],
+            np.arange(0.0, 1.05, 0.05),
+        )
+        self.assertEqual(hist.call_args.kwargs["label"], ("good", "abnormal"))
+        self.assertEqual(hist.call_args.kwargs["histtype"], "stepfilled")
+
     def test_existing_csv_is_migrated_to_the_new_column_order(self) -> None:
         result_path = self.root / "results.csv"
         result_path.write_text(

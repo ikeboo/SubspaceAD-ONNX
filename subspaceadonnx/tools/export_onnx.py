@@ -1,5 +1,7 @@
-# export_dinov3_middle_onnx.py
+'''
+python subspaceadonnx/tools/export_onnx.py --model-name facebook/dinov3-vitb16-pretrain-lvd1689m --output models/dinov3_vitb_middle7.onnx --height 448 --width 448
 
+'''
 from __future__ import annotations
 
 import argparse
@@ -10,7 +12,7 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoImageProcessor, AutoModel
+from transformers import AutoConfig, AutoImageProcessor, AutoModel
 
 
 def parse_layers(s: str | None) -> list[int] | None:
@@ -80,6 +82,8 @@ class DINOv3MiddleLayerExport(nn.Module):
             p.requires_grad_(False)
 
         self.selected_layers = list(selected_layers)
+        if not self.selected_layers:
+            raise ValueError("selected_layers must contain at least one layer.")
         self.l2_normalize = bool(l2_normalize)
 
         self.num_register_tokens = int(
@@ -122,8 +126,12 @@ class DINOv3MiddleLayerExport(nn.Module):
         if self.l2_normalize:
             patch_tokens = F.normalize(patch_tokens, dim=-1)
 
-        last_hidden = outputs.last_hidden_state
-        cls_token = last_hidden[:, 0, :]       # [B, C]
+        # Returning the backbone's final CLS token would keep every block after
+        # the last selected feature layer in the exported ONNX graph.  SubspaceAD
+        # does not consume CLS, so use the last selected layer and let ONNX dead
+        # code elimination prune those otherwise-unused blocks.
+        cls_token_layer = max(self.selected_layers)
+        cls_token = hidden_states[cls_token_layer][:, 0, :]  # [B, C]
 
         if self.l2_normalize:
             cls_token = F.normalize(cls_token, dim=-1)
@@ -181,18 +189,16 @@ def main():
             "Fixed H/W is safer for ONNX Runtime / TensorRT."
         ),
     )
-    parser.add_argument("--opset", type=int, default=17)
+    parser.add_argument("--opset", type=int, default=18)
 
     args = parser.parse_args()
 
     processor = AutoImageProcessor.from_pretrained(args.model_name)
-    raw_model = AutoModel.from_pretrained(args.model_name)
-    num_hidden_layers = int(raw_model.config.num_hidden_layers)
-    patch_size = int(raw_model.config.patch_size)
-    num_register_tokens = int(getattr(raw_model.config, "num_register_tokens", 0))
-    hidden_size = int(raw_model.config.hidden_size)
-
-    del raw_model
+    config = AutoConfig.from_pretrained(args.model_name)
+    num_hidden_layers = int(config.num_hidden_layers)
+    patch_size = int(config.patch_size)
+    num_register_tokens = int(getattr(config, "num_register_tokens", 0))
+    hidden_size = int(config.hidden_size)
 
     selected_layers = parse_layers(args.layers)
     if selected_layers is None:
@@ -269,6 +275,8 @@ def main():
         "hidden_size": hidden_size,
         "num_hidden_layers": num_hidden_layers,
         "selected_layers": selected_layers,
+        "cls_token_layer": max(selected_layers),
+        "aggregation": "mean",
         "l2_normalize": not args.no_l2_normalize,
         "image_mean": getattr(processor, "image_mean", None),
         "image_std": getattr(processor, "image_std", None),

@@ -6,7 +6,7 @@ import json
 import math
 import warnings
 from pathlib import Path
-from typing import Callable, Optional, Iterable, Tuple
+from typing import Optional, Tuple
 from tqdm.auto import tqdm
 import cv2
 import numpy as np
@@ -58,8 +58,14 @@ class SubspaceAD:
         pca_dim: Optional[int] = None,
         max_fit_tokens: Optional[int] = None,
         feature_l2_normalize: bool = False,
+        spatial_centering: float = 1.0,
+        score_transform: str = "log",
         normalize_map: bool = False,
         calibration_target: float = 0.5,
+        calibration_fraction: float = 0.1,
+        score_offset_quantile: float = 0.01,
+        threshold_quantile: float = 0.995,
+        image_threshold_quantile: float = 0.99,
         blur: bool = True,
         eps: float = 1e-8,
         random_state: int = 0,
@@ -85,11 +91,26 @@ class SubspaceAD:
             feature_l2_normalize:
                 DINOv3ラッパーが未正規化特徴を返す場合にTrueを検討。
                 既にx_norm_patchtokens相当ならFalse推奨。
+            spatial_centering:
+                各patch位置の正常特徴平均をPCA前に差し引く強さ。0.0は従来の
+                global PCA、1.0は完全な位置中心化です。特徴そのものは保持せず、
+                位置ごとの平均だけを保存します。
+            score_transform:
+                PCA残差に適用する単調変換。"squared"、"sqrt"、"log"から選択。
+                logは大きな正常残差の影響を抑え、局所異常を見やすくします。
             normalize_map:
                 Trueの場合、共通スケーリング後の異常マップをさらに画像ごとに
                 0-1正規化する。画像間で共通の閾値を使う場合はFalseにする。
             calibration_target:
                 fit画像全体の異常マップ最大値を合わせる値。
+            calibration_fraction:
+                PCA学習から除外し、閾値校正に使う正常画像の割合。
+            score_offset_quantile:
+                正常スコアから差し引く下側分位点。
+            threshold_quantile:
+                holdout正常画素からpixel閾値を決める分位点。
+            image_threshold_quantile:
+                holdout正常画像の最大値からimage閾値を決める分位点。
             blur:
                 異常マップをresize後に軽くGaussian blurする。
             eps:
@@ -111,13 +132,34 @@ class SubspaceAD:
             raise ValueError("pca_ev または pca_dim のどちらかは指定してください。")
         if calibration_target <= 0:
             raise ValueError("calibration_targetは0より大きい値にしてください。")
+        if not 0.0 <= spatial_centering <= 1.0:
+            raise ValueError("spatial_centeringは0.0から1.0の範囲にしてください。")
+        if score_transform not in {"squared", "sqrt", "log"}:
+            raise ValueError(
+                "score_transformは'squared'、'sqrt'、'log'のいずれかにしてください。"
+            )
+        if not 0.0 <= calibration_fraction < 1.0:
+            raise ValueError("calibration_fractionは0.0以上1.0未満にしてください。")
+        for name, value in (
+            ("score_offset_quantile", score_offset_quantile),
+            ("threshold_quantile", threshold_quantile),
+            ("image_threshold_quantile", image_threshold_quantile),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name}は0.0から1.0の範囲にしてください。")
 
         self.pca_ev = pca_ev
         self.pca_dim = pca_dim
         self.max_fit_tokens = max_fit_tokens
         self.feature_l2_normalize = feature_l2_normalize
+        self.spatial_centering = float(spatial_centering)
+        self.score_transform = score_transform
         self.normalize_map = normalize_map
         self.calibration_target = float(calibration_target)
+        self.calibration_fraction = float(calibration_fraction)
+        self.score_offset_quantile = float(score_offset_quantile)
+        self.threshold_quantile = float(threshold_quantile)
+        self.image_threshold_quantile = float(image_threshold_quantile)
         self.blur = blur
         self.eps = eps
         self.random_state = random_state
@@ -127,8 +169,14 @@ class SubspaceAD:
         self.eigvals_: Optional[np.ndarray] = None
         self.n_components_: Optional[int] = None
         self.feature_dim_: Optional[int] = None
+        self.position_mean_: Optional[np.ndarray] = None
+        self.score_reference_: float = 1.0
+        self.score_offset_: float = 0.0
         self.fit_max_score_: Optional[float] = None
         self.score_scale_: float = 1.0
+        self.threshold_: float = self.calibration_target
+        self.image_threshold_: float = self.calibration_target
+        self.calibration_count_: int = 0
 
     def fit(self, imgs: list[np.ndarray] | str | Path) -> "SubspaceAD":
         """
@@ -139,7 +187,7 @@ class SubspaceAD:
                 正常画像のlist、または正常画像を含むディレクトリ。
                 listの各要素は np.ndarray で、DINOv3ラッパーが受け付ける
                 形式に合わせてください。ディレクトリの場合は配下を再帰的に
-                探索し、対応する画像ファイルをRGBで読み込みます。
+                探索し、対応する画像ファイルをOpenCVのBGRで読み込みます。
 
         Returns:
             self
@@ -150,15 +198,18 @@ class SubspaceAD:
         if len(imgs) == 0:
             raise ValueError("fitには少なくとも1枚の正常画像が必要です。")
 
-        all_features = []
         extracted = []
 
         for img in tqdm(imgs, desc="Extracting features",unit="images"):
             feat, grid_size = self._extract_patch_features(img)
-            all_features.append(feat)
             extracted.append((feat, grid_size, img.shape[:2]))
 
-        X = np.concatenate(all_features, axis=0).astype(np.float64)
+        fit_extracted, calibration_extracted = self._split_fit_calibration(extracted)
+        self._fit_position_center(fit_extracted)
+        centered_features = [
+            self._center_features(feat) for feat, _, _ in fit_extracted
+        ]
+        X = np.concatenate(centered_features, axis=0).astype(np.float64)
 
         if self.max_fit_tokens is not None and X.shape[0] > self.max_fit_tokens:
             rng = np.random.default_rng(self.random_state)
@@ -166,15 +217,86 @@ class SubspaceAD:
             X = X[idx]
         print(f"Fitting PCA on {X.shape[0]} patch tokens with feature dim {X.shape[1]}.")
         self._fit_pca(X)
-        self._fit_score_scale(extracted)
+        self._fit_score_reference(X)
+        self._fit_score_scale(extracted, calibration_extracted)
         return self
+
+    def _split_fit_calibration(
+        self,
+        extracted: list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
+    ) -> tuple[
+        list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
+        list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
+    ]:
+        """Reserve normal images for threshold calibration when possible."""
+        n_images = len(extracted)
+        if self.calibration_fraction <= 0.0 or n_images < 10:
+            self.calibration_count_ = n_images
+            return extracted, extracted
+
+        n_calibration = max(1, int(round(n_images * self.calibration_fraction)))
+        n_calibration = min(n_calibration, n_images - 2)
+        rng = np.random.default_rng(self.random_state)
+        calibration_indices = set(
+            rng.choice(n_images, size=n_calibration, replace=False).tolist()
+        )
+        fit_extracted = [
+            item for index, item in enumerate(extracted)
+            if index not in calibration_indices
+        ]
+        calibration_extracted = [
+            item for index, item in enumerate(extracted)
+            if index in calibration_indices
+        ]
+        self.calibration_count_ = len(calibration_extracted)
+        return fit_extracted, calibration_extracted
+
+    def _fit_position_center(
+        self,
+        extracted: list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
+    ) -> None:
+        """Fit a compact position-conditioned normal mean.
+
+        A single mean vector per patch position captures the expected object layout
+        without retaining any training tokens.  Interpolating it with the global
+        mean makes ``spatial_centering=0`` exactly equivalent to global centering.
+        """
+        first_features, first_grid, _ = extracted[0]
+        n_patches, feature_dim = first_features.shape
+        for features, grid_size, _ in extracted[1:]:
+            if grid_size != first_grid or features.shape != (n_patches, feature_dim):
+                raise ValueError(
+                    "All fit images must produce the same patch grid and feature dim: "
+                    f"expected grid={first_grid}, features={(n_patches, feature_dim)}, "
+                    f"got grid={grid_size}, features={features.shape}"
+                )
+
+        position_mean = np.zeros((n_patches, feature_dim), dtype=np.float64)
+        for features, _, _ in extracted:
+            position_mean += features
+        position_mean /= len(extracted)
+        global_mean = np.mean(position_mean, axis=0, keepdims=True)
+        self.position_mean_ = (
+            global_mean
+            + self.spatial_centering * (position_mean - global_mean)
+        ).astype(np.float32)
+
+    def _center_features(self, features: np.ndarray) -> np.ndarray:
+        if self.position_mean_ is None:
+            return features
+        if features.shape != self.position_mean_.shape:
+            raise ValueError(
+                "patch feature shape mismatch for spatial centering: "
+                f"got {features.shape}, expected {self.position_mean_.shape}"
+            )
+        return features - self.position_mean_
 
     @classmethod
     def load_images_from_directory(
         cls,
         directory_path: str | Path,
     ) -> list[np.ndarray]:
-        """ディレクトリ配下の対応画像ファイルをRGBで読み込む。
+        """ディレクトリ配下の対応画像ファイルをOpenCVのBGRで読み込む。
 
         サブディレクトリも再帰的に探索し、パス順に読み込みます。画像以外の
         ファイルは無視します。
@@ -183,7 +305,7 @@ class SubspaceAD:
             directory_path: 画像を含むディレクトリ。
 
         Returns:
-            RGB画像のlist。
+            BGR画像のlist。
         """
         directory = Path(directory_path)
         if not directory.exists():
@@ -206,7 +328,7 @@ class SubspaceAD:
             image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
             if image is None:
                 raise ValueError(f"Unable to read image: {image_path}")
-            images.append(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            images.append(image)
 
         return images
 
@@ -252,7 +374,7 @@ class SubspaceAD:
             output_size,
             return_patch_map=return_patch_map,
         )
-        out = out * self.score_scale_
+        out = self._calibrate_map(out)
 
         do_norm = self.normalize_map if normalize_map is None else normalize_map
         if do_norm:
@@ -263,34 +385,87 @@ class SubspaceAD:
     def _fit_score_scale(
         self,
         extracted: list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
+        calibration_extracted: Optional[
+            list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]]
+        ] = None,
     ) -> None:
-        """fit画像全体の最大異常値から、画像間で共通の係数を求める。"""
-        fit_max = 0.0
+        """Fit affine map calibration and normal-only operating thresholds."""
+        if calibration_extracted is None:
+            calibration_extracted = extracted
 
-        for feat, grid_size, output_size in tqdm(
-            extracted,
+        scored = []
+        patch_scores = []
+        for feat, grid_size, output_size in extracted:
+            scores = self._score_features(feat)
+            scored.append((scores, grid_size, output_size))
+            patch_scores.append(scores)
+
+        self.score_offset_ = float(
+            np.quantile(
+                np.concatenate(patch_scores),
+                self.score_offset_quantile,
+            )
+        )
+        fit_max = 0.0
+        for scores, grid_size, output_size in tqdm(
+            scored,
             desc="Calibrating anomaly-map scale",
             unit="images"
         ):
-            scores = self._score_features(feat)
             anomaly_map = self._scores_to_map(scores, grid_size, output_size)
             fit_max = max(fit_max, float(np.max(anomaly_map)))
 
         self.fit_max_score_ = fit_max
-        if fit_max <= self.eps:
+        score_range = fit_max - self.score_offset_
+        if score_range <= self.eps:
             self.score_scale_ = 1.0
             warnings.warn(
-                "fit画像の最大異常値がほぼ0のため、異常マップの係数を1.0にしました。",
+                "fit画像の異常スコア範囲がほぼ0のため、係数を1.0にしました。",
                 RuntimeWarning,
                 stacklevel=2,
             )
         else:
-            self.score_scale_ = self.calibration_target / fit_max
+            self.score_scale_ = self.calibration_target / score_range
+
+        calibration_pixels = []
+        calibration_maxima = []
+        for feat, grid_size, output_size in calibration_extracted:
+            scores = self._score_features(feat)
+            anomaly_map = self._scores_to_map(
+                scores,
+                grid_size,
+                output_size,
+            )
+            anomaly_map = self._calibrate_map(anomaly_map)
+            calibration_pixels.append(anomaly_map.ravel())
+            calibration_maxima.append(float(np.max(anomaly_map)))
+
+        self.threshold_ = float(
+            np.quantile(
+                np.concatenate(calibration_pixels),
+                self.threshold_quantile,
+            )
+        )
+        self.image_threshold_ = float(
+            np.quantile(
+                np.asarray(calibration_maxima),
+                self.image_threshold_quantile,
+            )
+        )
 
         print(
             "Anomaly-map scale calibrated: "
-            f"fit_max={self.fit_max_score_:.6g}, scale={self.score_scale_:.6g}, "
-            f"scaled_max={self.fit_max_score_ * self.score_scale_:.6g}"
+            f"offset={self.score_offset_:.6g}, fit_max={self.fit_max_score_:.6g}, "
+            f"scale={self.score_scale_:.6g}, "
+            f"scaled_max={(self.fit_max_score_ - self.score_offset_) * self.score_scale_:.6g}, "
+            f"pixel_threshold={self.threshold_:.6g}, "
+            f"image_threshold={self.image_threshold_:.6g}"
+        )
+
+    def _calibrate_map(self, anomaly_map: np.ndarray) -> np.ndarray:
+        return (
+            np.maximum(anomaly_map - self.score_offset_, 0.0)
+            * self.score_scale_
         )
 
     def _scores_to_map(
@@ -324,7 +499,7 @@ class SubspaceAD:
         self,
         target_img: np.ndarray,
         *,
-        method: str = "mtop1p",
+        method: str = "max",
     ) -> float:
         """
         異常マップから画像単位の異常スコアを作る補助関数。
@@ -334,7 +509,8 @@ class SubspaceAD:
                 入力画像。
             method:
                 画像スコアの集約方法。
-                - "max": 最大異常値をそのまま用いる。
+                - "max": 最大異常値をそのまま用いる。学習済みの
+                  image_threshold_に対応する既定値。
                 - "mean": 異常マップ全体の平均値を用いる。
                 - "p99": 99パーセンタイル値を用いる。
                 - "mtop5": 最高異常値上位5個の平均を用いる。
@@ -370,6 +546,7 @@ class SubspaceAD:
         """
         DINOv3からpatch tokenを取り出し、[N, C]に変換する。
         """
+        # SubspaceADの公開入力はOpenCV BGR。色変換せずDINOv3へ渡す。
         out = self.dino(img)
 
         if not isinstance(out, (tuple, list)) or len(out) < 2:
@@ -513,14 +690,9 @@ class SubspaceAD:
         self.eigvals_ = eigvals[:k].astype(np.float64)
         self.components_ = eigvecs[:, :k].astype(np.float64)
 
-    def _score_features(self, X: np.ndarray) -> np.ndarray:
-        """
-        PCA再構成残差をpatch異常スコアにする。
-        """
-        self._check_fitted()
-
+    def _squared_spe_centered(self, X: np.ndarray) -> np.ndarray:
+        """Return squared PCA residuals for position-centered features."""
         X = X.astype(np.float64)
-
         if X.shape[1] != self.feature_dim_:
             raise ValueError(
                 f"feature dim mismatch: got {X.shape[1]}, expected {self.feature_dim_}"
@@ -528,10 +700,33 @@ class SubspaceAD:
 
         Xc = X - self.mean_
         z = Xc @ self.components_
-        x_recon = (z @ self.components_.T) + self.mean_
+        # Components are orthonormal, so the squared reconstruction residual is
+        # ||Xc||^2 - ||projection||^2. Avoid materializing the reconstruction.
+        scores = np.sum(Xc * Xc, axis=1) - np.sum(z * z, axis=1)
+        return np.maximum(scores, 0.0)
 
-        residual = X - x_recon
-        scores = np.sum(residual * residual, axis=1)
+    def _fit_score_reference(self, centered_features: np.ndarray) -> None:
+        """Fit a data-scale reference so log compression adds no huge offset."""
+        raw_scores = self._squared_spe_centered(centered_features)
+        positive_scores = raw_scores[raw_scores > self.eps]
+        if positive_scores.size == 0:
+            self.score_reference_ = 1.0
+        else:
+            self.score_reference_ = max(
+                float(np.median(positive_scores)),
+                self.eps,
+            )
+
+    def _score_features(self, X: np.ndarray) -> np.ndarray:
+        """Use PCA reconstruction residuals as patch anomaly scores."""
+        self._check_fitted()
+        centered = self._center_features(X)
+        scores = self._squared_spe_centered(centered)
+
+        if self.score_transform == "sqrt":
+            scores = np.sqrt(scores)
+        elif self.score_transform == "log":
+            scores = np.log1p(scores / self.score_reference_)
 
         return scores.astype(np.float32)
 
@@ -559,8 +754,14 @@ class SubspaceAD:
             "pca_ev": self.pca_ev,
             "pca_dim": self.pca_dim,
             "feature_l2_normalize": self.feature_l2_normalize,
+            "spatial_centering": self.spatial_centering,
+            "score_transform": self.score_transform,
             "normalize_map": self.normalize_map,
             "calibration_target": self.calibration_target,
+            "calibration_fraction": self.calibration_fraction,
+            "score_offset_quantile": self.score_offset_quantile,
+            "threshold_quantile": self.threshold_quantile,
+            "image_threshold_quantile": self.image_threshold_quantile,
             "blur": self.blur,
             "eps": self.eps,
             "mean": self.mean_,
@@ -568,8 +769,14 @@ class SubspaceAD:
             "eigvals": self.eigvals_,
             "n_components": self.n_components_,
             "feature_dim": self.feature_dim_,
+            "position_mean": self.position_mean_,
+            "score_reference": self.score_reference_,
+            "score_offset": self.score_offset_,
             "fit_max_score": self.fit_max_score_,
             "score_scale": self.score_scale_,
+            "threshold": self.threshold_,
+            "image_threshold": self.image_threshold_,
+            "calibration_count": self.calibration_count_,
         }
 
     def save_npz(self, npz_path: str | Path) -> None:
@@ -584,7 +791,7 @@ class SubspaceAD:
         """
         state = self.state_dict()
         metadata = {
-            "format_version": 1,
+            "format_version": 3,
             "model_name": str(state["model_name"]),
             "pca_ev": (
                 None if state["pca_ev"] is None else float(state["pca_ev"])
@@ -593,22 +800,37 @@ class SubspaceAD:
                 None if state["pca_dim"] is None else int(state["pca_dim"])
             ),
             "feature_l2_normalize": bool(state["feature_l2_normalize"]),
+            "spatial_centering": float(state["spatial_centering"]),
+            "score_transform": str(state["score_transform"]),
             "normalize_map": bool(state["normalize_map"]),
             "calibration_target": float(state["calibration_target"]),
+            "calibration_fraction": float(state["calibration_fraction"]),
+            "score_offset_quantile": float(state["score_offset_quantile"]),
+            "threshold_quantile": float(state["threshold_quantile"]),
+            "image_threshold_quantile": float(
+                state["image_threshold_quantile"]
+            ),
             "blur": bool(state["blur"]),
             "eps": float(state["eps"]),
             "n_components": int(state["n_components"]),
             "feature_dim": int(state["feature_dim"]),
+            "score_reference": float(state["score_reference"]),
+            "score_offset": float(state["score_offset"]),
             "fit_max_score": float(state["fit_max_score"]),
             "score_scale": float(state["score_scale"]),
+            "threshold": float(state["threshold"]),
+            "image_threshold": float(state["image_threshold"]),
+            "calibration_count": int(state["calibration_count"]),
         }
-        np.savez_compressed(
-            npz_path,
-            metadata=np.asarray(json.dumps(metadata)),
-            mean=state["mean"],
-            components=state["components"],
-            eigvals=state["eigvals"],
-        )
+        arrays = {
+            "metadata": np.asarray(json.dumps(metadata)),
+            "mean": state["mean"],
+            "components": state["components"],
+            "eigvals": state["eigvals"],
+        }
+        if state["position_mean"] is not None:
+            arrays["position_mean"] = state["position_mean"]
+        np.savez_compressed(npz_path, **arrays)
 
     def load_npz(self, npz_path: str | Path) -> "SubspaceAD":
         """Load PCA state and inference settings saved by :meth:`save_npz`.
@@ -637,7 +859,8 @@ class SubspaceAD:
             if not isinstance(metadata, dict):
                 raise ValueError("Invalid SubspaceAD NPZ metadata.")
 
-            if metadata.get("format_version") != 1:
+            format_version = metadata.get("format_version")
+            if format_version not in {1, 2, 3}:
                 raise ValueError(
                     "Unsupported SubspaceAD NPZ format version: "
                     f"{metadata.get('format_version')!r}"
@@ -649,6 +872,10 @@ class SubspaceAD:
                 "components": np.array(saved["components"], copy=True),
                 "eigvals": np.array(saved["eigvals"], copy=True),
             }
+            if "position_mean" in saved.files:
+                state["position_mean"] = np.array(
+                    saved["position_mean"], copy=True
+                )
 
         self.load_state_dict(state)
         return self
@@ -678,7 +905,6 @@ class SubspaceAD:
         img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if img is None:
             raise ValueError(f"Unable to read image: {image_path}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         return self(
             img,
@@ -689,16 +915,17 @@ class SubspaceAD:
     def predict_mask(
         self,
         image_path: str,
-        threshold: float = 0.5,
+        threshold: Optional[float] = None,
         output_size: Optional[Tuple[int, int]] = None,
-        normalize_map: Optional[bool] = True,
+        normalize_map: Optional[bool] = False,
     ) -> np.ndarray:
         """
         Reads an image from disk, computes the anomaly map, and returns a binary mask.
 
         Args:
             image_path: Path to the image file.
-            threshold: Threshold applied to the anomaly map.
+            threshold: Threshold applied to the anomaly map. If None, use the
+                normal holdout threshold learned during fit.
             output_size: Size of the output anomaly map / mask (height, width).
             normalize_map: Whether to apply per-image min-max normalization.
                 If None, self.normalize_map is used.
@@ -711,6 +938,8 @@ class SubspaceAD:
             output_size=output_size,
             normalize_map=normalize_map,
         )
+        if threshold is None:
+            threshold = self.threshold_
         return (anomaly_map >= threshold).astype(np.uint8) * 255
 
     def load_state_dict(self, state: dict) -> None:
@@ -720,9 +949,19 @@ class SubspaceAD:
         self.pca_ev = state["pca_ev"]
         self.pca_dim = state["pca_dim"]
         self.feature_l2_normalize = state["feature_l2_normalize"]
+        self.spatial_centering = float(state.get("spatial_centering", 0.0))
+        self.score_transform = str(state.get("score_transform", "squared"))
         self.normalize_map = state["normalize_map"]
         self.calibration_target = float(
             state["calibration_target"] if "calibration_target" in state else 0.5
+        )
+        self.calibration_fraction = float(state.get("calibration_fraction", 0.0))
+        self.score_offset_quantile = float(
+            state.get("score_offset_quantile", 0.0)
+        )
+        self.threshold_quantile = float(state.get("threshold_quantile", 1.0))
+        self.image_threshold_quantile = float(
+            state.get("image_threshold_quantile", 1.0)
         )
         self.blur = state["blur"]
         self.eps = state["eps"]
@@ -732,9 +971,20 @@ class SubspaceAD:
         self.eigvals_ = state["eigvals"]
         self.n_components_ = state["n_components"]
         self.feature_dim_ = state["feature_dim"]
+        self.position_mean_ = state.get("position_mean")
+        self.score_reference_ = float(
+            state.get(
+                "score_reference",
+                self.eps if self.score_transform == "log" else 1.0,
+            )
+        )
+        self.score_offset_ = float(state.get("score_offset", 0.0))
         self.fit_max_score_ = float(
             state["fit_max_score"] if "fit_max_score" in state else 0.0
         )
         self.score_scale_ = float(
             state["score_scale"] if "score_scale" in state else 1.0
         )
+        self.threshold_ = float(state.get("threshold", 0.5))
+        self.image_threshold_ = float(state.get("image_threshold", 0.5))
+        self.calibration_count_ = int(state.get("calibration_count", 0))
