@@ -49,6 +49,34 @@ class ScoringTests(unittest.TestCase):
             np.argsort(squared),
         )
 
+    def test_multi_branch_score_is_mean_of_independent_pcas(self) -> None:
+        model = SubspaceAD(
+            "dual.onnx",
+            dino=object(),
+            pca_ev=None,
+            pca_dim=3,
+            spatial_centering=0.0,
+            score_transform="squared",
+        )
+        extracted = [
+            (
+                np.stack((self.train[index:index + 4], self.train[index + 4:index + 8])),
+                (2, 2),
+                (8, 8),
+            )
+            for index in range(0, 72, 8)
+        ]
+        model._fit_branches(extracted)
+        features = np.stack((self.test[:4], self.test[4:8]))
+        expected = np.mean(
+            np.stack([
+                branch._score_features(features[index])
+                for index, branch in enumerate(model.branch_models_)
+            ]),
+            axis=0,
+        )
+        np.testing.assert_allclose(model._score_features(features), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

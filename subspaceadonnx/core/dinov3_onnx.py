@@ -83,33 +83,38 @@ class DINOv3:
     def __call__(self, img: np.ndarray):
         x = self.preprocess(img)
 
-        cls_token, patch_tokens = self.session.run(
+        outputs = self.session.run(
             None,
             {self.input_name: x},
         )
+        if len(outputs) < 2:
+            raise ValueError("DINOv3 ONNX must return CLS and at least one patch output.")
 
-        cls_token = cls_token[0]          # [C]
-        patch_tokens = patch_tokens[0]    # [N, C]
+        cls_token = outputs[0][0]          # [C]
+        patch_groups = []
+        for output in outputs[1:]:
+            patch_tokens = output[0]       # [N, C]
+            n, c = patch_tokens.shape
+            expected_n = self.grid_h * self.grid_w
 
-        n, c = patch_tokens.shape
-        expected_n = self.grid_h * self.grid_w
-
-        if n != expected_n:
-            # dynamic H/W export時などの保険
-            s = int(np.sqrt(n))
-            if s * s == n:
-                grid_h, grid_w = s, s
+            if n != expected_n:
+                # dynamic H/W export時などの保険
+                s = int(np.sqrt(n))
+                if s * s == n:
+                    grid_h, grid_w = s, s
+                else:
+                    raise ValueError(
+                        f"Cannot infer patch grid: N={n}, "
+                        f"default grid={self.grid_h}x{self.grid_w}"
+                    )
             else:
-                raise ValueError(
-                    f"Cannot infer patch grid: N={n}, "
-                    f"default grid={self.grid_h}x{self.grid_w}"
-                )
-        else:
-            grid_h, grid_w = self.grid_h, self.grid_w
+                grid_h, grid_w = self.grid_h, self.grid_w
 
-        patch_tokens = patch_tokens.reshape(grid_h, grid_w, c)
+            patch_groups.append(
+                patch_tokens.reshape(grid_h, grid_w, c).astype(np.float32)
+            )
 
-        return cls_token.astype(np.float32), patch_tokens.astype(np.float32)
+        return (cls_token.astype(np.float32), *patch_groups)
 
     def preprocess(self, img: np.ndarray) -> np.ndarray:
         """

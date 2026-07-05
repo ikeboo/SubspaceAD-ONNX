@@ -58,6 +58,7 @@ class SubspaceAD:
         pca_dim: Optional[int] = None,
         max_fit_tokens: Optional[int] = None,
         feature_l2_normalize: bool = False,
+        branch_fusion: str = "mean",
         spatial_centering: float = 1.0,
         score_transform: str = "log",
         normalize_map: bool = False,
@@ -91,6 +92,9 @@ class SubspaceAD:
             feature_l2_normalize:
                 DINOv3ラッパーが未正規化特徴を返す場合にTrueを検討。
                 既にx_norm_patchtokens相当ならFalse推奨。
+            branch_fusion:
+                ONNXが複数のpatch token列を返す場合のscore統合方法。
+                各出力に独立PCAを学習し、現在は"mean"で平均します。
             spatial_centering:
                 各patch位置の正常特徴平均をPCA前に差し引く強さ。0.0は従来の
                 global PCA、1.0は完全な位置中心化です。特徴そのものは保持せず、
@@ -138,6 +142,8 @@ class SubspaceAD:
             raise ValueError(
                 "score_transformは'squared'、'sqrt'、'log'のいずれかにしてください。"
             )
+        if branch_fusion != "mean":
+            raise ValueError("branch_fusionは現在'mean'のみ対応しています。")
         if not 0.0 <= calibration_fraction < 1.0:
             raise ValueError("calibration_fractionは0.0以上1.0未満にしてください。")
         for name, value in (
@@ -152,6 +158,7 @@ class SubspaceAD:
         self.pca_dim = pca_dim
         self.max_fit_tokens = max_fit_tokens
         self.feature_l2_normalize = feature_l2_normalize
+        self.branch_fusion = branch_fusion
         self.spatial_centering = float(spatial_centering)
         self.score_transform = score_transform
         self.normalize_map = normalize_map
@@ -177,6 +184,7 @@ class SubspaceAD:
         self.threshold_: float = self.calibration_target
         self.image_threshold_: float = self.calibration_target
         self.calibration_count_: int = 0
+        self.branch_models_: list[SubspaceAD] = []
 
     def fit(self, imgs: list[np.ndarray] | str | Path) -> "SubspaceAD":
         """
@@ -205,6 +213,11 @@ class SubspaceAD:
             extracted.append((feat, grid_size, img.shape[:2]))
 
         fit_extracted, calibration_extracted = self._split_fit_calibration(extracted)
+        if extracted[0][0].ndim == 3:
+            self._fit_branches(fit_extracted)
+            self._fit_score_scale(extracted, calibration_extracted)
+            return self
+
         self._fit_position_center(fit_extracted)
         centered_features = [
             self._center_features(feat) for feat, _, _ in fit_extracted
@@ -220,6 +233,60 @@ class SubspaceAD:
         self._fit_score_reference(X)
         self._fit_score_scale(extracted, calibration_extracted)
         return self
+
+    def _fit_branches(
+        self,
+        extracted: list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
+    ) -> None:
+        """Fit one compact PCA per ONNX patch-token output."""
+        branch_count = extracted[0][0].shape[0]
+        if any(item[0].ndim != 3 or item[0].shape[0] != branch_count for item in extracted):
+            raise ValueError("All fit images must return the same patch-token branches.")
+
+        self.branch_models_ = []
+        for branch_index in range(branch_count):
+            branch = self._new_branch_model()
+            branch_extracted = [
+                (features[branch_index], grid_size, output_size)
+                for features, grid_size, output_size in extracted
+            ]
+            branch._fit_position_center(branch_extracted)
+            x = np.concatenate(
+                [branch._center_features(item[0]) for item in branch_extracted],
+                axis=0,
+            ).astype(np.float64)
+            if self.max_fit_tokens is not None and x.shape[0] > self.max_fit_tokens:
+                rng = np.random.default_rng(self.random_state)
+                indices = rng.choice(x.shape[0], size=self.max_fit_tokens, replace=False)
+                x = x[indices]
+            print(
+                f"Fitting branch {branch_index + 1}/{branch_count} PCA on "
+                f"{x.shape[0]} patch tokens with feature dim {x.shape[1]}."
+            )
+            branch._fit_pca(x)
+            branch._fit_score_reference(x)
+            self.branch_models_.append(branch)
+
+    def _new_branch_model(self) -> "SubspaceAD":
+        return SubspaceAD(
+            self.model_name,
+            dino=object(),
+            pca_ev=self.pca_ev,
+            pca_dim=self.pca_dim,
+            max_fit_tokens=self.max_fit_tokens,
+            feature_l2_normalize=self.feature_l2_normalize,
+            spatial_centering=self.spatial_centering,
+            score_transform=self.score_transform,
+            normalize_map=self.normalize_map,
+            calibration_target=self.calibration_target,
+            calibration_fraction=0.0,
+            score_offset_quantile=self.score_offset_quantile,
+            threshold_quantile=self.threshold_quantile,
+            image_threshold_quantile=self.image_threshold_quantile,
+            blur=self.blur,
+            eps=self.eps,
+            random_state=self.random_state,
+        )
 
     def _split_fit_calibration(
         self,
@@ -554,16 +621,25 @@ class SubspaceAD:
                 "DINOv3(img) は (cls_token, patch_tokens) を返す必要があります。"
             )
 
-        _, patch_tokens = out
-        patch_grid, grid_size = self._patch_tokens_to_grid(patch_tokens, img)
+        features = []
+        grid_size = None
+        for patch_tokens in out[1:]:
+            patch_grid, current_grid = self._patch_tokens_to_grid(patch_tokens, img)
+            if grid_size is not None and current_grid != grid_size:
+                raise ValueError(
+                    "All patch-token outputs must use the same grid: "
+                    f"got {grid_size} and {current_grid}"
+                )
+            grid_size = current_grid
+            feat = patch_grid.reshape(-1, patch_grid.shape[-1]).astype(np.float32)
+            if self.feature_l2_normalize:
+                norm = np.linalg.norm(feat, axis=1, keepdims=True)
+                feat = feat / (norm + self.eps)
+            features.append(feat)
 
-        feat = patch_grid.reshape(-1, patch_grid.shape[-1]).astype(np.float32)
-
-        if self.feature_l2_normalize:
-            norm = np.linalg.norm(feat, axis=1, keepdims=True)
-            feat = feat / (norm + self.eps)
-
-        return feat, grid_size
+        if len(features) == 1:
+            return features[0], grid_size
+        return np.stack(features, axis=0), grid_size
 
     def _patch_tokens_to_grid(
         self,
@@ -720,6 +796,17 @@ class SubspaceAD:
     def _score_features(self, X: np.ndarray) -> np.ndarray:
         """Use PCA reconstruction residuals as patch anomaly scores."""
         self._check_fitted()
+        if self.branch_models_:
+            if X.ndim != 3 or X.shape[0] != len(self.branch_models_):
+                raise ValueError(
+                    f"Expected {len(self.branch_models_)} feature branches, got {X.shape}"
+                )
+            branch_scores = [
+                model._score_features(X[index])
+                for index, model in enumerate(self.branch_models_)
+            ]
+            return np.mean(np.stack(branch_scores, axis=0), axis=0).astype(np.float32)
+
         centered = self._center_features(X)
         scores = self._squared_spe_centered(centered)
 
@@ -731,6 +818,9 @@ class SubspaceAD:
         return scores.astype(np.float32)
 
     def _check_fitted(self) -> None:
+        if self.branch_models_:
+            if all(model.mean_ is not None and model.components_ is not None for model in self.branch_models_):
+                return
         if self.mean_ is None or self.components_ is None:
             raise RuntimeError("SubspaceAD is not fitted. Call model.fit(normal_imgs) first.")
 
@@ -754,6 +844,8 @@ class SubspaceAD:
             "pca_ev": self.pca_ev,
             "pca_dim": self.pca_dim,
             "feature_l2_normalize": self.feature_l2_normalize,
+            "branch_fusion": self.branch_fusion,
+            "branches": [model.state_dict() for model in self.branch_models_],
             "spatial_centering": self.spatial_centering,
             "score_transform": self.score_transform,
             "normalize_map": self.normalize_map,
@@ -790,8 +882,9 @@ class SubspaceAD:
                 supplied path does not already end with that suffix.
         """
         state = self.state_dict()
+        is_multi_branch = bool(state["branches"])
         metadata = {
-            "format_version": 3,
+            "format_version": 4 if is_multi_branch else 3,
             "model_name": str(state["model_name"]),
             "pca_ev": (
                 None if state["pca_ev"] is None else float(state["pca_ev"])
@@ -800,6 +893,7 @@ class SubspaceAD:
                 None if state["pca_dim"] is None else int(state["pca_dim"])
             ),
             "feature_l2_normalize": bool(state["feature_l2_normalize"]),
+            "branch_fusion": str(state["branch_fusion"]),
             "spatial_centering": float(state["spatial_centering"]),
             "score_transform": str(state["score_transform"]),
             "normalize_map": bool(state["normalize_map"]),
@@ -812,24 +906,43 @@ class SubspaceAD:
             ),
             "blur": bool(state["blur"]),
             "eps": float(state["eps"]),
-            "n_components": int(state["n_components"]),
-            "feature_dim": int(state["feature_dim"]),
-            "score_reference": float(state["score_reference"]),
             "score_offset": float(state["score_offset"]),
-            "fit_max_score": float(state["fit_max_score"]),
+            "fit_max_score": float(state["fit_max_score"] or 0.0),
             "score_scale": float(state["score_scale"]),
             "threshold": float(state["threshold"]),
             "image_threshold": float(state["image_threshold"]),
             "calibration_count": int(state["calibration_count"]),
         }
-        arrays = {
-            "metadata": np.asarray(json.dumps(metadata)),
-            "mean": state["mean"],
-            "components": state["components"],
-            "eigvals": state["eigvals"],
-        }
-        if state["position_mean"] is not None:
-            arrays["position_mean"] = state["position_mean"]
+        arrays = {"metadata": np.asarray(json.dumps(metadata))}
+        if is_multi_branch:
+            branch_metadata = []
+            for index, branch in enumerate(state["branches"]):
+                branch_metadata.append({
+                    key: value
+                    for key, value in branch.items()
+                    if key not in {"mean", "components", "eigvals", "position_mean", "branches"}
+                })
+                arrays[f"branch_{index}_mean"] = branch["mean"]
+                arrays[f"branch_{index}_components"] = branch["components"]
+                arrays[f"branch_{index}_eigvals"] = branch["eigvals"]
+                if branch["position_mean"] is not None:
+                    arrays[f"branch_{index}_position_mean"] = branch["position_mean"]
+            metadata["branch_metadata"] = branch_metadata
+            arrays["metadata"] = np.asarray(json.dumps(metadata))
+        else:
+            metadata.update({
+                "n_components": int(state["n_components"]),
+                "feature_dim": int(state["feature_dim"]),
+                "score_reference": float(state["score_reference"]),
+            })
+            arrays.update({
+                "metadata": np.asarray(json.dumps(metadata)),
+                "mean": state["mean"],
+                "components": state["components"],
+                "eigvals": state["eigvals"],
+            })
+            if state["position_mean"] is not None:
+                arrays["position_mean"] = state["position_mean"]
         np.savez_compressed(npz_path, **arrays)
 
     def load_npz(self, npz_path: str | Path) -> "SubspaceAD":
@@ -844,9 +957,8 @@ class SubspaceAD:
         Returns:
             self
         """
-        required_keys = {"metadata", "mean", "components", "eigvals"}
         with np.load(npz_path, allow_pickle=False) as saved:
-            missing_keys = required_keys.difference(saved.files)
+            missing_keys = {"metadata"}.difference(saved.files)
             if missing_keys:
                 missing = ", ".join(sorted(missing_keys))
                 raise ValueError(f"Invalid SubspaceAD NPZ: missing keys: {missing}")
@@ -860,22 +972,53 @@ class SubspaceAD:
                 raise ValueError("Invalid SubspaceAD NPZ metadata.")
 
             format_version = metadata.get("format_version")
-            if format_version not in {1, 2, 3}:
+            if format_version not in {1, 2, 3, 4}:
                 raise ValueError(
                     "Unsupported SubspaceAD NPZ format version: "
                     f"{metadata.get('format_version')!r}"
                 )
 
-            state = {
-                **metadata,
-                "mean": np.array(saved["mean"], copy=True),
-                "components": np.array(saved["components"], copy=True),
-                "eigvals": np.array(saved["eigvals"], copy=True),
-            }
-            if "position_mean" in saved.files:
-                state["position_mean"] = np.array(
-                    saved["position_mean"], copy=True
-                )
+            if format_version == 4:
+                branch_metadata = metadata.pop("branch_metadata", None)
+                if not isinstance(branch_metadata, list) or not branch_metadata:
+                    raise ValueError("Invalid multi-branch SubspaceAD NPZ metadata.")
+                branches = []
+                for index, branch_meta in enumerate(branch_metadata):
+                    prefix = f"branch_{index}_"
+                    required = {prefix + name for name in ("mean", "components", "eigvals")}
+                    missing = required.difference(saved.files)
+                    if missing:
+                        raise ValueError(
+                            "Invalid SubspaceAD NPZ: missing keys: "
+                            + ", ".join(sorted(missing))
+                        )
+                    branch = {
+                        **branch_meta,
+                        "mean": np.array(saved[prefix + "mean"], copy=True),
+                        "components": np.array(saved[prefix + "components"], copy=True),
+                        "eigvals": np.array(saved[prefix + "eigvals"], copy=True),
+                    }
+                    position_key = prefix + "position_mean"
+                    if position_key in saved.files:
+                        branch["position_mean"] = np.array(saved[position_key], copy=True)
+                    branches.append(branch)
+                state = {**metadata, "branches": branches}
+            else:
+                required_keys = {"mean", "components", "eigvals"}
+                missing_keys = required_keys.difference(saved.files)
+                if missing_keys:
+                    missing = ", ".join(sorted(missing_keys))
+                    raise ValueError(f"Invalid SubspaceAD NPZ: missing keys: {missing}")
+                state = {
+                    **metadata,
+                    "mean": np.array(saved["mean"], copy=True),
+                    "components": np.array(saved["components"], copy=True),
+                    "eigvals": np.array(saved["eigvals"], copy=True),
+                }
+                if "position_mean" in saved.files:
+                    state["position_mean"] = np.array(
+                        saved["position_mean"], copy=True
+                    )
 
         self.load_state_dict(state)
         return self
@@ -949,6 +1092,7 @@ class SubspaceAD:
         self.pca_ev = state["pca_ev"]
         self.pca_dim = state["pca_dim"]
         self.feature_l2_normalize = state["feature_l2_normalize"]
+        self.branch_fusion = str(state.get("branch_fusion", "mean"))
         self.spatial_centering = float(state.get("spatial_centering", 0.0))
         self.score_transform = str(state.get("score_transform", "squared"))
         self.normalize_map = state["normalize_map"]
@@ -966,11 +1110,17 @@ class SubspaceAD:
         self.blur = state["blur"]
         self.eps = state["eps"]
 
-        self.mean_ = state["mean"]
-        self.components_ = state["components"]
-        self.eigvals_ = state["eigvals"]
-        self.n_components_ = state["n_components"]
-        self.feature_dim_ = state["feature_dim"]
+        self.branch_models_ = []
+        for branch_state in state.get("branches", []):
+            branch = self._new_branch_model()
+            branch.load_state_dict(branch_state)
+            self.branch_models_.append(branch)
+
+        self.mean_ = state.get("mean")
+        self.components_ = state.get("components")
+        self.eigvals_ = state.get("eigvals")
+        self.n_components_ = state.get("n_components")
+        self.feature_dim_ = state.get("feature_dim")
         self.position_mean_ = state.get("position_mean")
         self.score_reference_ = float(
             state.get(
@@ -980,7 +1130,7 @@ class SubspaceAD:
         )
         self.score_offset_ = float(state.get("score_offset", 0.0))
         self.fit_max_score_ = float(
-            state["fit_max_score"] if "fit_max_score" in state else 0.0
+            (state["fit_max_score"] if "fit_max_score" in state else 0.0) or 0.0
         )
         self.score_scale_ = float(
             state["score_scale"] if "score_scale" in state else 1.0

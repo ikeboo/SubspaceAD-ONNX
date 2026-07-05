@@ -164,6 +164,38 @@ class PcaPersistenceTests(unittest.TestCase):
         self.assertEqual(restored.score_offset_, 0.0)
         self.assertEqual(restored.threshold_, 0.5)
 
+    def test_multi_branch_save_and_load_round_trip(self) -> None:
+        original = SubspaceAD(
+            "dual.onnx",
+            dino=object(),
+            pca_ev=None,
+            pca_dim=2,
+            spatial_centering=0.0,
+            score_transform="log",
+        )
+        rng = np.random.default_rng(4)
+        extracted = []
+        for _ in range(5):
+            features = rng.normal(size=(2, 4, 6)).astype(np.float32)
+            extracted.append((features, (2, 2), (8, 8)))
+        original._fit_branches(extracted)
+        original.score_offset_ = 0.2
+        original.score_scale_ = 0.3
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            npz_path = Path(temp_dir) / "dual.npz"
+            original.save_npz(npz_path)
+            restored = SubspaceAD("dual.onnx", dino=object()).load_npz(npz_path)
+
+        self.assertEqual(len(restored.branch_models_), 2)
+        test_features = rng.normal(size=(2, 4, 6)).astype(np.float32)
+        np.testing.assert_allclose(
+            restored._score_features(test_features),
+            original._score_features(test_features),
+        )
+        self.assertEqual(restored.score_offset_, original.score_offset_)
+        self.assertEqual(restored.score_scale_, original.score_scale_)
+
 
 if __name__ == "__main__":
     unittest.main()

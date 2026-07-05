@@ -32,6 +32,16 @@ def parse_layers(s: str | None) -> list[int] | None:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
+def parse_layer_groups(s: str | None) -> list[list[int]] | None:
+    """Parse semicolon-separated layer groups such as ``2,3,4,5;6,7,8,9``."""
+    if s is None or s.strip() == "":
+        return None
+    groups = [parse_layers(group) for group in s.split(";")]
+    if any(not group for group in groups):
+        raise ValueError("Each --layer-groups entry must contain at least one layer.")
+    return groups  # type: ignore[return-value]
+
+
 def default_middle_layers(num_hidden_layers: int, k: int = 7) -> list[int]:
     """
     SubspaceADのMiddle-7に近い「中央7層」を自動選択する。
@@ -71,6 +81,7 @@ class DINOv3MiddleLayerExport(nn.Module):
         model_name: str,
         selected_layers: Sequence[int],
         *,
+        layer_groups: Sequence[Sequence[int]] | None = None,
         l2_normalize: bool = True,
     ):
         super().__init__()
@@ -81,9 +92,18 @@ class DINOv3MiddleLayerExport(nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad_(False)
 
-        self.selected_layers = list(selected_layers)
+        self.layer_groups = (
+            [list(group) for group in layer_groups]
+            if layer_groups is not None
+            else [list(selected_layers)]
+        )
+        self.selected_layers = sorted(
+            {layer for group in self.layer_groups for layer in group}
+        )
         if not self.selected_layers:
             raise ValueError("selected_layers must contain at least one layer.")
+        if any(not group for group in self.layer_groups):
+            raise ValueError("layer_groups must not contain an empty group.")
         self.l2_normalize = bool(l2_normalize)
 
         self.num_register_tokens = int(
@@ -111,20 +131,17 @@ class DINOv3MiddleLayerExport(nn.Module):
 
         patch_start = 1 + self.num_register_tokens
 
-        patches = []
-        for layer_idx in self.selected_layers:
-            x = hidden_states[layer_idx]       # [B, 1 + R + N, C]
-            x = x[:, patch_start:, :]          # [B, N, C]
-            patches.append(x)
-
-        # [B, L, N, C]
-        patches = torch.stack(patches, dim=1)
-
-        # SubspaceAD用: 中間層特徴を平均して1つのpatch token列にする
-        patch_tokens = patches.mean(dim=1)     # [B, N, C]
-
-        if self.l2_normalize:
-            patch_tokens = F.normalize(patch_tokens, dim=-1)
+        patch_token_groups = []
+        layer_groups = getattr(self, "layer_groups", [self.selected_layers])
+        for group in layer_groups:
+            patches = [
+                hidden_states[layer_idx][:, patch_start:, :]
+                for layer_idx in group
+            ]
+            patch_tokens = torch.stack(patches, dim=1).mean(dim=1)
+            if self.l2_normalize:
+                patch_tokens = F.normalize(patch_tokens, dim=-1)
+            patch_token_groups.append(patch_tokens)
 
         # Returning the backbone's final CLS token would keep every block after
         # the last selected feature layer in the exported ONNX graph.  SubspaceAD
@@ -136,7 +153,7 @@ class DINOv3MiddleLayerExport(nn.Module):
         if self.l2_normalize:
             cls_token = F.normalize(cls_token, dim=-1)
 
-        return cls_token, patch_tokens
+        return (cls_token, *patch_token_groups)
 
 
 def main():
@@ -172,6 +189,15 @@ def main():
         help="Used only when --layers is omitted.",
     )
     parser.add_argument(
+        "--layer-groups",
+        type=str,
+        default=None,
+        help=(
+            "Semicolon-separated groups averaged into separate patch-token outputs. "
+            "Example: '2,3,4,5;6,7,8,9'. Overrides --layers/--middle-k."
+        ),
+    )
+    parser.add_argument(
         "--no-l2-normalize",
         action="store_true",
         help="Disable L2 normalization of exported features.",
@@ -200,16 +226,21 @@ def main():
     num_register_tokens = int(getattr(config, "num_register_tokens", 0))
     hidden_size = int(config.hidden_size)
 
-    selected_layers = parse_layers(args.layers)
-    if selected_layers is None:
-        selected_layers = default_middle_layers(
-            num_hidden_layers=num_hidden_layers,
-            k=args.middle_k,
-        )
+    layer_groups = parse_layer_groups(args.layer_groups)
+    if layer_groups is None:
+        selected_layers = parse_layers(args.layers)
+        if selected_layers is None:
+            selected_layers = default_middle_layers(
+                num_hidden_layers=num_hidden_layers,
+                k=args.middle_k,
+            )
+        layer_groups = [selected_layers]
+    selected_layers = sorted({layer for group in layer_groups for layer in group})
 
     print("model_name:", args.model_name)
     print("num_hidden_layers:", num_hidden_layers)
     print("selected_layers:", selected_layers)
+    print("layer_groups:", layer_groups)
     print("patch_size:", patch_size)
     print("num_register_tokens:", num_register_tokens)
     print("hidden_size:", hidden_size)
@@ -224,32 +255,37 @@ def main():
     model = DINOv3MiddleLayerExport(
         model_name=args.model_name,
         selected_layers=selected_layers,
+        layer_groups=layer_groups,
         l2_normalize=not args.no_l2_normalize,
     )
     model.eval()
 
     dummy = torch.randn(1, 3, args.height, args.width, dtype=torch.float32)
 
+    patch_output_names = [
+        "patch_tokens" if len(layer_groups) == 1 else f"patch_tokens_{index}"
+        for index in range(len(layer_groups))
+    ]
+    output_names = ["cls_token", *patch_output_names]
     dynamic_axes = None
 
     if args.dynamic_batch or args.dynamic_hw:
-        dynamic_axes = {
-            "pixel_values": {},
-            "cls_token": {},
-            "patch_tokens": {},
-        }
+        dynamic_axes = {name: {} for name in ["pixel_values", *output_names]}
 
         if args.dynamic_batch:
             dynamic_axes["pixel_values"][0] = "batch"
             dynamic_axes["cls_token"][0] = "batch"
-            dynamic_axes["patch_tokens"][0] = "batch"
+            for name in patch_output_names:
+                dynamic_axes[name][0] = "batch"
 
         if args.dynamic_hw:
             dynamic_axes["pixel_values"][2] = "height"
             dynamic_axes["pixel_values"][3] = "width"
-            dynamic_axes["patch_tokens"][1] = "num_patches"
+            for name in patch_output_names:
+                dynamic_axes[name][1] = "num_patches"
         else:
-            dynamic_axes["patch_tokens"][1] = "num_patches"
+            for name in patch_output_names:
+                dynamic_axes[name][1] = "num_patches"
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,7 +296,7 @@ def main():
             dummy,
             str(output_path),
             input_names=["pixel_values"],
-            output_names=["cls_token", "patch_tokens"],
+            output_names=output_names,
             dynamic_axes=dynamic_axes,
             opset_version=args.opset,
             do_constant_folding=True,
@@ -275,8 +311,9 @@ def main():
         "hidden_size": hidden_size,
         "num_hidden_layers": num_hidden_layers,
         "selected_layers": selected_layers,
+        "layer_groups": layer_groups,
         "cls_token_layer": max(selected_layers),
-        "aggregation": "mean",
+        "aggregation": "mean" if len(layer_groups) == 1 else "grouped_mean",
         "l2_normalize": not args.no_l2_normalize,
         "image_mean": getattr(processor, "image_mean", None),
         "image_std": getattr(processor, "image_std", None),

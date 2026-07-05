@@ -1,0 +1,13 @@
+date,datasets,img_auroc,img_aupr,seg_auroc,seg_pro,description
+2026-07-05 00:27:26,bottle,1.00000,1.00000,0.98802,0.94754,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,capsule,0.93777,0.98612,0.98849,0.94546,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,carpet,0.99920,0.99975,0.99397,0.97026,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,grid,0.99081,0.99707,0.98852,0.96517,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,hazelnut,0.99964,0.99980,0.99139,0.96131,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,leather,1.00000,1.00000,0.99434,0.98325,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,screw,0.79033,0.91629,0.97715,0.90439,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,tile,1.00000,1.00000,0.97835,0.93374,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,toothbrush,0.92778,0.96595,0.99097,0.92676,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,transistor,0.96833,0.95412,0.95595,0.79454,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,wood,0.98947,0.99675,0.96477,0.93428,dual_2-5_6-9_score_mean
+2026-07-05 00:27:26,average,0.96394,0.98326,0.98290,0.93334,dual_2-5_6-9_score_mean;bottle;capsule;carpet;grid;hazelnut;leather;screw;tile;toothbrush;transistor;wood

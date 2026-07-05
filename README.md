@@ -42,6 +42,22 @@ uv run python subspaceadonnx/tools/export_onnx.py \
   --output models/dinov3_custom.onnx
 ```
 
+To keep shallow/local and deeper/structural cues separate, export multiple
+layer groups with semicolons. Each group is averaged independently and becomes
+one ONNX patch-token output:
+
+```bash
+uv run python subspaceadonnx/tools/export_onnx.py \
+  --model-name facebook/dinov3-vits16plus-pretrain-lvd1689m \
+  --height 224 --width 224 \
+  --layer-groups '2,3,4,5;6,7,8,9' \
+  --output models/dinov3_vitsplus_224_dual.onnx
+```
+
+`SubspaceAD` detects these outputs automatically, fits an independent PCA to
+each group, and averages their log-SPE patch scores. The final selected layer
+is still block 9, so graph pruning and feature-extraction speed are retained.
+
 ## 2. Run anomaly detection
 
 ```python
@@ -180,6 +196,7 @@ DINOv3-ViT-S+ Middle-7 model gave the following macro averages:
 | Global PCA + squared SPE | 0.95421 | 0.97498 | 0.97650 | 0.91787 | 268.1s |
 | Spatial PCA + legacy log-SPE | **0.95903** | **0.97952** | **0.98018** | 0.92446 | 263.7s |
 | Spatial PCA + calibrated log-SPE (current) | 0.95875 | 0.97908 | 0.98015 | **0.92493** | **255.9s** |
+| Dual 2–5 / 6–9 independent PCA + score mean | **0.96394** | **0.98326** | **0.98290** | **0.93334** | — |
 
 The calibrated version fixes anomaly-map contrast and learns usable operating
 thresholds; its four macro metrics remain above the original global-PCA
@@ -189,6 +206,11 @@ baseline. Per-category results are in
 The pruned 224px export produced identical patch tokens in a direct comparison,
 reduced the graph from 704 to 535 nodes and feature-extraction latency from
 22.18ms to 17.97ms on CPU (100-image warm benchmark).
+
+The dual export has 543 nodes and measured 17.70ms versus 17.74ms for the
+single-output pruned graph in a same-process 100-run CPU benchmark. Its full
+11-category results are in
+[`outputs/dual_branch_vitsplus_224.csv`](outputs/dual_branch_vitsplus_224.csv).
 
 See [inference.ipynb](inference.ipynb) for additional visualization and examples of saving and restoring the PCA parameters.
 
