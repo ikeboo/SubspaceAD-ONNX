@@ -15,5 +15,6 @@ dependencies = [
     "ipykernel",
     "ipywidgets",
     "matplotlib",
-    "tqdm"
+    "tqdm",
+    "sentencepiece>=0.2.1",
 ]

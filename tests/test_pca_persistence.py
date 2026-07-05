@@ -18,6 +18,10 @@ class PcaPersistenceTests(unittest.TestCase):
             feature_l2_normalize=True,
             spatial_centering=0.75,
             score_transform="sqrt",
+            multiband_pca_ev=0.8,
+            multiband_score_weight=0.2,
+            tail_score_quantile=0.9,
+            tail_score_gain=0.4,
             normalize_map=True,
             calibration_target=0.25,
             blur=False,
@@ -34,6 +38,8 @@ class PcaPersistenceTests(unittest.TestCase):
         model._fit_pca(features)
         model.position_mean_ = np.arange(6, dtype=np.float32).reshape(2, 3)
         model.score_reference_ = 0.125
+        model.multiband_score_reference_ = 0.25
+        model.tail_score_reference_ = 1.5
         model.score_offset_ = 0.25
         model.fit_max_score_ = 2.5
         model.score_scale_ = 0.1
@@ -63,6 +69,16 @@ class PcaPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(restored.spatial_centering, original.spatial_centering)
         self.assertEqual(restored.score_transform, original.score_transform)
+        self.assertEqual(restored.multiband_pca_ev, original.multiband_pca_ev)
+        self.assertEqual(
+            restored.multiband_score_weight,
+            original.multiband_score_weight,
+        )
+        self.assertEqual(
+            restored.tail_score_quantile,
+            original.tail_score_quantile,
+        )
+        self.assertEqual(restored.tail_score_gain, original.tail_score_gain)
         np.testing.assert_array_equal(
             restored.position_mean_, original.position_mean_
         )
@@ -73,6 +89,18 @@ class PcaPersistenceTests(unittest.TestCase):
         self.assertEqual(restored.n_components_, original.n_components_)
         self.assertEqual(restored.feature_dim_, original.feature_dim_)
         self.assertEqual(restored.score_reference_, original.score_reference_)
+        self.assertEqual(
+            restored.multiband_components_,
+            original.multiband_components_,
+        )
+        self.assertEqual(
+            restored.multiband_score_reference_,
+            original.multiband_score_reference_,
+        )
+        self.assertEqual(
+            restored.tail_score_reference_,
+            original.tail_score_reference_,
+        )
         self.assertEqual(restored.score_offset_, original.score_offset_)
         self.assertEqual(restored.fit_max_score_, original.fit_max_score_)
         self.assertEqual(restored.score_scale_, original.score_scale_)
@@ -161,6 +189,10 @@ class PcaPersistenceTests(unittest.TestCase):
 
         self.assertEqual(restored.score_transform, "log")
         self.assertEqual(restored.score_reference_, metadata["eps"])
+        self.assertIsNone(restored.multiband_pca_ev)
+        self.assertEqual(restored.multiband_score_weight, 0.0)
+        self.assertIsNone(restored.tail_score_quantile)
+        self.assertEqual(restored.tail_score_gain, 0.0)
         self.assertEqual(restored.score_offset_, 0.0)
         self.assertEqual(restored.threshold_, 0.5)
 

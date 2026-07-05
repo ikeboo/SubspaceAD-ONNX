@@ -121,22 +121,29 @@ By default, PCA is fitted after subtracting the normal mean at each patch
 position (`spatial_centering=1.0`). Only one mean vector per position is saved;
 training features are not retained as a memory bank. Inference uses the
 orthogonal-projection identity for the squared residual and applies a logarithmic
-transform relative to the learned median normal SPE. A lower normal-score offset
-is subtracted before scaling, so normal maps retain useful contrast while their
-training maximum remains 0.5. A normal holdout split learns separate pixel and
-image thresholds. The legacy global-PCA behavior remains available:
+transform relative to the learned median normal SPE. By default, it combines
+residuals from the 99% and 95% PCA subspaces (`multiband_pca_ev=0.95`) using the
+same projection, recovering subtle deviations that the fine subspace can
+reconstruct away. Scores above the learned normal 99th percentile receive a
+small linear tail gain. These additions retain only PCA statistics and add no
+feature search or memory bank. A lower normal-score offset is subtracted before
+scaling, so normal maps retain useful contrast while their training maximum
+remains 0.5. A normal holdout split learns separate pixel and image thresholds.
+The legacy single-band behavior remains available:
 
 ```python
 legacy_model = SubspaceAD(
     "models/dinov3_vitb_middle7.onnx",
     spatial_centering=0.0,
     score_transform="squared",
+    multiband_pca_ev=None,
+    tail_score_quantile=None,
 )
 ```
 
-`score_transform` also accepts `"sqrt"`. Version-3 NPZ files persist the learned
-reference, offset and thresholds. Version-1/2 files remain loadable
-with their legacy scoring behavior.
+`score_transform` also accepts `"sqrt"`. Version-5 NPZ files persist the
+multi-band and tail statistics. Version-1 through version-4 files remain
+loadable with their historical scoring behavior.
 
 ## Image mask prediction
 
@@ -197,6 +204,7 @@ DINOv3-ViT-S+ Middle-7 model gave the following macro averages:
 | Spatial PCA + legacy log-SPE | **0.95903** | **0.97952** | **0.98018** | 0.92446 | 263.7s |
 | Spatial PCA + calibrated log-SPE (current) | 0.95875 | 0.97908 | 0.98015 | **0.92493** | **255.9s** |
 | Dual 2–5 / 6–9 independent PCA + score mean | **0.96394** | **0.98326** | **0.98290** | **0.93334** | — |
+| Dual + 95/99% multi-band SPE + normal-tail gain | **0.96485** | **0.98335** | **0.98330** | **0.93502** | — |
 
 The calibrated version fixes anomaly-map contrast and learns usable operating
 thresholds; its four macro metrics remain above the original global-PCA
@@ -211,6 +219,8 @@ The dual export has 543 nodes and measured 17.70ms versus 17.74ms for the
 single-output pruned graph in a same-process 100-run CPU benchmark. Its full
 11-category results are in
 [`outputs/dual_branch_vitsplus_224.csv`](outputs/dual_branch_vitsplus_224.csv).
+The multi-band/tail result is in
+[`outputs/subspacead_multiband_v5_224.csv`](outputs/subspacead_multiband_v5_224.csv).
 
 See [inference.ipynb](inference.ipynb) for additional visualization and examples of saving and restoring the PCA parameters.
 

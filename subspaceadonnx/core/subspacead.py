@@ -61,6 +61,10 @@ class SubspaceAD:
         branch_fusion: str = "mean",
         spatial_centering: float = 1.0,
         score_transform: str = "log",
+        multiband_pca_ev: Optional[float] = 0.95,
+        multiband_score_weight: float = 0.25,
+        tail_score_quantile: Optional[float] = 0.99,
+        tail_score_gain: float = 0.25,
         normalize_map: bool = False,
         calibration_target: float = 0.5,
         calibration_fraction: float = 0.1,
@@ -102,6 +106,18 @@ class SubspaceAD:
             score_transform:
                 PCA残差に適用する単調変換。"squared"、"sqrt"、"log"から選択。
                 logは大きな正常残差の影響を抑え、局所異常を見やすくします。
+            multiband_pca_ev:
+                log-SPEに併用する粗いPCA部分空間の累積寄与率。0.95なら、
+                通常の0.99部分空間で再構成される中分散方向も25%だけ異常度へ
+                戻します。Noneで無効化します。追加の行列積は発生しません。
+            multiband_score_weight:
+                粗い部分空間のlog-SPEを混合する重み。0.0で従来の単帯域SPE、
+                1.0で粗い部分空間だけを使用します。
+            tail_score_quantile:
+                正常patch scoreの上側分位点。ここを超えたscoreだけを増幅し、
+                小さな異常領域のimage scoreへの寄与を保ちます。Noneで無効化。
+            tail_score_gain:
+                tail_score_quantileを超えた分に追加する線形gain。
             normalize_map:
                 Trueの場合、共通スケーリング後の異常マップをさらに画像ごとに
                 0-1正規化する。画像間で共通の閾値を使う場合はFalseにする。
@@ -144,6 +160,16 @@ class SubspaceAD:
             )
         if branch_fusion != "mean":
             raise ValueError("branch_fusionは現在'mean'のみ対応しています。")
+        if multiband_pca_ev is not None and not 0.0 < multiband_pca_ev <= 1.0:
+            raise ValueError("multiband_pca_evは0より大きく1.0以下にしてください。")
+        if not 0.0 <= multiband_score_weight <= 1.0:
+            raise ValueError(
+                "multiband_score_weightは0.0から1.0の範囲にしてください。"
+            )
+        if tail_score_quantile is not None and not 0.0 <= tail_score_quantile <= 1.0:
+            raise ValueError("tail_score_quantileは0.0から1.0の範囲にしてください。")
+        if tail_score_gain < 0.0:
+            raise ValueError("tail_score_gainは0.0以上にしてください。")
         if not 0.0 <= calibration_fraction < 1.0:
             raise ValueError("calibration_fractionは0.0以上1.0未満にしてください。")
         for name, value in (
@@ -161,6 +187,14 @@ class SubspaceAD:
         self.branch_fusion = branch_fusion
         self.spatial_centering = float(spatial_centering)
         self.score_transform = score_transform
+        self.multiband_pca_ev = (
+            None if multiband_pca_ev is None else float(multiband_pca_ev)
+        )
+        self.multiband_score_weight = float(multiband_score_weight)
+        self.tail_score_quantile = (
+            None if tail_score_quantile is None else float(tail_score_quantile)
+        )
+        self.tail_score_gain = float(tail_score_gain)
         self.normalize_map = normalize_map
         self.calibration_target = float(calibration_target)
         self.calibration_fraction = float(calibration_fraction)
@@ -178,6 +212,9 @@ class SubspaceAD:
         self.feature_dim_: Optional[int] = None
         self.position_mean_: Optional[np.ndarray] = None
         self.score_reference_: float = 1.0
+        self.multiband_components_: Optional[int] = None
+        self.multiband_score_reference_: float = 1.0
+        self.tail_score_reference_: float = 0.0
         self.score_offset_: float = 0.0
         self.fit_max_score_: Optional[float] = None
         self.score_scale_: float = 1.0
@@ -277,6 +314,10 @@ class SubspaceAD:
             feature_l2_normalize=self.feature_l2_normalize,
             spatial_centering=self.spatial_centering,
             score_transform=self.score_transform,
+            multiband_pca_ev=self.multiband_pca_ev,
+            multiband_score_weight=self.multiband_score_weight,
+            tail_score_quantile=self.tail_score_quantile,
+            tail_score_gain=self.tail_score_gain,
             normalize_map=self.normalize_map,
             calibration_target=self.calibration_target,
             calibration_fraction=0.0,
@@ -473,12 +514,9 @@ class SubspaceAD:
                 self.score_offset_quantile,
             )
         )
+        print("Calibrating anomaly-map scale")
         fit_max = 0.0
-        for scores, grid_size, output_size in tqdm(
-            scored,
-            desc="Calibrating anomaly-map scale",
-            unit="images"
-        ):
+        for scores, grid_size, output_size in scored:
             anomaly_map = self._scores_to_map(scores, grid_size, output_size)
             fit_max = max(fit_max, float(np.max(anomaly_map)))
 
@@ -762,12 +800,34 @@ class SubspaceAD:
 
         k = max(1, min(k, c))
 
+        multiband_k = k
+        if self.multiband_pca_ev is not None:
+            total = float(np.sum(eigvals))
+            if total > self.eps:
+                multiband_cum = np.cumsum(eigvals) / total
+                multiband_k = int(
+                    np.searchsorted(multiband_cum, self.multiband_pca_ev) + 1
+                )
+                # The coarse band must be a subspace of the components already
+                # projected for the main score. Clamping also makes explicit
+                # pca_dim configurations degrade to the original single band.
+                multiband_k = max(1, min(multiband_k, k))
+
         self.n_components_ = k
+        self.multiband_components_ = multiband_k
         self.eigvals_ = eigvals[:k].astype(np.float64)
         self.components_ = eigvecs[:, :k].astype(np.float64)
 
     def _squared_spe_centered(self, X: np.ndarray) -> np.ndarray:
         """Return squared PCA residuals for position-centered features."""
+        scores, _ = self._squared_spe_bands_centered(X)
+        return scores
+
+    def _squared_spe_bands_centered(
+        self,
+        X: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return fine and coarse squared residuals from one PCA projection."""
         X = X.astype(np.float64)
         if X.shape[1] != self.feature_dim_:
             raise ValueError(
@@ -779,11 +839,23 @@ class SubspaceAD:
         # Components are orthonormal, so the squared reconstruction residual is
         # ||Xc||^2 - ||projection||^2. Avoid materializing the reconstruction.
         scores = np.sum(Xc * Xc, axis=1) - np.sum(z * z, axis=1)
-        return np.maximum(scores, 0.0)
+        scores = np.maximum(scores, 0.0)
+
+        multiband_k = self.multiband_components_
+        if multiband_k is None or multiband_k >= z.shape[1]:
+            return scores, scores
+
+        # The 0.95 residual equals the 0.99 residual plus the energy captured
+        # between their component cutoffs. Reuse z so inference needs no second
+        # matrix multiplication and no reconstructed feature tensor.
+        coarse_scores = scores + np.sum(z[:, multiband_k:] ** 2, axis=1)
+        return scores, coarse_scores
 
     def _fit_score_reference(self, centered_features: np.ndarray) -> None:
-        """Fit a data-scale reference so log compression adds no huge offset."""
-        raw_scores = self._squared_spe_centered(centered_features)
+        """Fit robust scales for spectral SPE bands and normal-score tail."""
+        raw_scores, multiband_scores = self._squared_spe_bands_centered(
+            centered_features
+        )
         positive_scores = raw_scores[raw_scores > self.eps]
         if positive_scores.size == 0:
             self.score_reference_ = 1.0
@@ -792,6 +864,52 @@ class SubspaceAD:
                 float(np.median(positive_scores)),
                 self.eps,
             )
+
+        positive_multiband = multiband_scores[multiband_scores > self.eps]
+        if positive_multiband.size == 0:
+            self.multiband_score_reference_ = 1.0
+        else:
+            self.multiband_score_reference_ = max(
+                float(np.median(positive_multiband)),
+                self.eps,
+            )
+
+        base_scores = self._transform_spe_bands(raw_scores, multiband_scores)
+        if self.tail_score_quantile is None:
+            self.tail_score_reference_ = 0.0
+        else:
+            self.tail_score_reference_ = float(
+                np.quantile(base_scores, self.tail_score_quantile)
+            )
+
+    def _transform_spe_bands(
+        self,
+        fine_scores: np.ndarray,
+        coarse_scores: np.ndarray,
+    ) -> np.ndarray:
+        """Transform and combine PCA residual bands before tail calibration."""
+        if self.score_transform == "sqrt":
+            return np.sqrt(fine_scores)
+        if self.score_transform == "squared":
+            return fine_scores
+
+        fine_log = np.log1p(fine_scores / self.score_reference_)
+        multiband_k = self.multiband_components_
+        use_multiband = (
+            self.multiband_pca_ev is not None
+            and self.multiband_score_weight > 0.0
+            and multiband_k is not None
+            and self.n_components_ is not None
+            and multiband_k < self.n_components_
+        )
+        if not use_multiband:
+            return fine_log
+
+        coarse_log = np.log1p(
+            coarse_scores / self.multiband_score_reference_
+        )
+        weight = self.multiband_score_weight
+        return (1.0 - weight) * fine_log + weight * coarse_log
 
     def _score_features(self, X: np.ndarray) -> np.ndarray:
         """Use PCA reconstruction residuals as patch anomaly scores."""
@@ -808,12 +926,18 @@ class SubspaceAD:
             return np.mean(np.stack(branch_scores, axis=0), axis=0).astype(np.float32)
 
         centered = self._center_features(X)
-        scores = self._squared_spe_centered(centered)
+        fine_scores, coarse_scores = self._squared_spe_bands_centered(centered)
+        scores = self._transform_spe_bands(fine_scores, coarse_scores)
 
-        if self.score_transform == "sqrt":
-            scores = np.sqrt(scores)
-        elif self.score_transform == "log":
-            scores = np.log1p(scores / self.score_reference_)
+        if (
+            self.score_transform == "log"
+            and self.tail_score_quantile is not None
+            and self.tail_score_gain > 0.0
+        ):
+            scores = scores + self.tail_score_gain * np.maximum(
+                scores - self.tail_score_reference_,
+                0.0,
+            )
 
         return scores.astype(np.float32)
 
@@ -848,6 +972,10 @@ class SubspaceAD:
             "branches": [model.state_dict() for model in self.branch_models_],
             "spatial_centering": self.spatial_centering,
             "score_transform": self.score_transform,
+            "multiband_pca_ev": self.multiband_pca_ev,
+            "multiband_score_weight": self.multiband_score_weight,
+            "tail_score_quantile": self.tail_score_quantile,
+            "tail_score_gain": self.tail_score_gain,
             "normalize_map": self.normalize_map,
             "calibration_target": self.calibration_target,
             "calibration_fraction": self.calibration_fraction,
@@ -863,6 +991,9 @@ class SubspaceAD:
             "feature_dim": self.feature_dim_,
             "position_mean": self.position_mean_,
             "score_reference": self.score_reference_,
+            "multiband_components": self.multiband_components_,
+            "multiband_score_reference": self.multiband_score_reference_,
+            "tail_score_reference": self.tail_score_reference_,
             "score_offset": self.score_offset_,
             "fit_max_score": self.fit_max_score_,
             "score_scale": self.score_scale_,
@@ -884,7 +1015,7 @@ class SubspaceAD:
         state = self.state_dict()
         is_multi_branch = bool(state["branches"])
         metadata = {
-            "format_version": 4 if is_multi_branch else 3,
+            "format_version": 5,
             "model_name": str(state["model_name"]),
             "pca_ev": (
                 None if state["pca_ev"] is None else float(state["pca_ev"])
@@ -896,6 +1027,18 @@ class SubspaceAD:
             "branch_fusion": str(state["branch_fusion"]),
             "spatial_centering": float(state["spatial_centering"]),
             "score_transform": str(state["score_transform"]),
+            "multiband_pca_ev": (
+                None
+                if state["multiband_pca_ev"] is None
+                else float(state["multiband_pca_ev"])
+            ),
+            "multiband_score_weight": float(state["multiband_score_weight"]),
+            "tail_score_quantile": (
+                None
+                if state["tail_score_quantile"] is None
+                else float(state["tail_score_quantile"])
+            ),
+            "tail_score_gain": float(state["tail_score_gain"]),
             "normalize_map": bool(state["normalize_map"]),
             "calibration_target": float(state["calibration_target"]),
             "calibration_fraction": float(state["calibration_fraction"]),
@@ -934,6 +1077,13 @@ class SubspaceAD:
                 "n_components": int(state["n_components"]),
                 "feature_dim": int(state["feature_dim"]),
                 "score_reference": float(state["score_reference"]),
+                "multiband_components": int(
+                    state["multiband_components"] or state["n_components"]
+                ),
+                "multiband_score_reference": float(
+                    state["multiband_score_reference"]
+                ),
+                "tail_score_reference": float(state["tail_score_reference"]),
             })
             arrays.update({
                 "metadata": np.asarray(json.dumps(metadata)),
@@ -972,13 +1122,16 @@ class SubspaceAD:
                 raise ValueError("Invalid SubspaceAD NPZ metadata.")
 
             format_version = metadata.get("format_version")
-            if format_version not in {1, 2, 3, 4}:
+            if format_version not in {1, 2, 3, 4, 5}:
                 raise ValueError(
                     "Unsupported SubspaceAD NPZ format version: "
                     f"{metadata.get('format_version')!r}"
                 )
 
-            if format_version == 4:
+            is_multi_branch = format_version == 4 or (
+                format_version == 5 and "branch_metadata" in metadata
+            )
+            if is_multi_branch:
                 branch_metadata = metadata.pop("branch_metadata", None)
                 if not isinstance(branch_metadata, list) or not branch_metadata:
                     raise ValueError("Invalid multi-branch SubspaceAD NPZ metadata.")
@@ -1019,6 +1172,16 @@ class SubspaceAD:
                     state["position_mean"] = np.array(
                         saved["position_mean"], copy=True
                     )
+
+            # Versions 1-4 predate spectral-band and tail scoring. Loading one
+            # must preserve its historical score rather than use new defaults.
+            if format_version < 5:
+                state.update({
+                    "multiband_pca_ev": None,
+                    "multiband_score_weight": 0.0,
+                    "tail_score_quantile": None,
+                    "tail_score_gain": 0.0,
+                })
 
         self.load_state_dict(state)
         return self
@@ -1095,6 +1258,16 @@ class SubspaceAD:
         self.branch_fusion = str(state.get("branch_fusion", "mean"))
         self.spatial_centering = float(state.get("spatial_centering", 0.0))
         self.score_transform = str(state.get("score_transform", "squared"))
+        self.multiband_pca_ev = state.get("multiband_pca_ev")
+        if self.multiband_pca_ev is not None:
+            self.multiband_pca_ev = float(self.multiband_pca_ev)
+        self.multiband_score_weight = float(
+            state.get("multiband_score_weight", 0.0)
+        )
+        self.tail_score_quantile = state.get("tail_score_quantile")
+        if self.tail_score_quantile is not None:
+            self.tail_score_quantile = float(self.tail_score_quantile)
+        self.tail_score_gain = float(state.get("tail_score_gain", 0.0))
         self.normalize_map = state["normalize_map"]
         self.calibration_target = float(
             state["calibration_target"] if "calibration_target" in state else 0.5
@@ -1127,6 +1300,15 @@ class SubspaceAD:
                 "score_reference",
                 self.eps if self.score_transform == "log" else 1.0,
             )
+        )
+        self.multiband_components_ = state.get("multiband_components")
+        if self.multiband_components_ is not None:
+            self.multiband_components_ = int(self.multiband_components_)
+        self.multiband_score_reference_ = float(
+            state.get("multiband_score_reference", self.score_reference_)
+        )
+        self.tail_score_reference_ = float(
+            state.get("tail_score_reference", 0.0)
         )
         self.score_offset_ = float(state.get("score_offset", 0.0))
         self.fit_max_score_ = float(

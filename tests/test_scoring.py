@@ -77,6 +77,55 @@ class ScoringTests(unittest.TestCase):
         )
         np.testing.assert_allclose(model._score_features(features), expected)
 
+    def test_multiband_log_spe_and_tail_gain_match_explicit_formula(self) -> None:
+        rng = np.random.default_rng(23)
+        scales = np.geomspace(2.0, 0.05, num=12)
+        train = rng.normal(size=(500, 12)) * scales
+        test = rng.normal(size=(20, 12)) * scales
+        model = SubspaceAD(
+            "model.onnx",
+            dino=object(),
+            pca_ev=0.95,
+            multiband_pca_ev=0.75,
+            multiband_score_weight=0.25,
+            tail_score_quantile=0.9,
+            tail_score_gain=0.5,
+            spatial_centering=0.0,
+            score_transform="log",
+        )
+        model._fit_pca(train)
+        model._fit_score_reference(train)
+
+        self.assertLess(model.multiband_components_, model.n_components_)
+        centered = test - model.mean_
+        projected = centered @ model.components_
+        fine = np.maximum(
+            np.sum(centered * centered, axis=1)
+            - np.sum(projected * projected, axis=1),
+            0.0,
+        )
+        coarse = fine + np.sum(
+            projected[:, model.multiband_components_:] ** 2,
+            axis=1,
+        )
+        base = (
+            0.75 * np.log1p(fine / model.score_reference_)
+            + 0.25 * np.log1p(
+                coarse / model.multiband_score_reference_
+            )
+        )
+        expected = base + 0.5 * np.maximum(
+            base - model.tail_score_reference_,
+            0.0,
+        )
+
+        np.testing.assert_allclose(
+            model._score_features(test),
+            expected,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

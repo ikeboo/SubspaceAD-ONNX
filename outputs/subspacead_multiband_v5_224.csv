@@ -1,0 +1,13 @@
+date,datasets,img_auroc,img_aupr,seg_auroc,seg_pro,description
+2026-07-05 10:24:39,bottle,1.00000,1.00000,0.98814,0.94913,subspacead_multiband_v5
+2026-07-05 10:24:39,capsule,0.94775,0.98842,0.98879,0.94765,subspacead_multiband_v5
+2026-07-05 10:24:39,carpet,0.99960,0.99988,0.99400,0.97065,subspacead_multiband_v5
+2026-07-05 10:24:39,grid,0.99332,0.99784,0.98859,0.96559,subspacead_multiband_v5
+2026-07-05 10:24:39,hazelnut,0.99964,0.99980,0.99150,0.96209,subspacead_multiband_v5
+2026-07-05 10:24:39,leather,1.00000,1.00000,0.99439,0.98355,subspacead_multiband_v5
+2026-07-05 10:24:39,screw,0.78705,0.91452,0.97800,0.90719,subspacead_multiband_v5
+2026-07-05 10:24:39,tile,1.00000,1.00000,0.97859,0.93385,subspacead_multiband_v5
+2026-07-05 10:24:39,toothbrush,0.92778,0.96595,0.99119,0.92817,subspacead_multiband_v5
+2026-07-05 10:24:39,transistor,0.96875,0.95372,0.95769,0.80226,subspacead_multiband_v5
+2026-07-05 10:24:39,wood,0.98947,0.99675,0.96538,0.93512,subspacead_multiband_v5
+2026-07-05 10:24:39,average,0.96485,0.98335,0.98330,0.93502,subspacead_multiband_v5;bottle;capsule;carpet;grid;hazelnut;leather;screw;tile;toothbrush;transistor;wood
