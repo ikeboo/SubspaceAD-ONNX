@@ -65,6 +65,13 @@ class SubspaceAD:
         multiband_score_weight: float = 0.25,
         tail_score_quantile: Optional[float] = 0.99,
         tail_score_gain: float = 0.25,
+        branch_local_tail_quantile: Optional[float] = 0.99,
+        branch_local_tail_gain: float = 1.0,
+        branch_local_tail_min_position_variance: float = 0.1,
+        branch_local_tail_max_position_variance: float = 0.5,
+        position_local_tail_quantile: Optional[float] = 0.95,
+        position_local_tail_gain: float = 0.5,
+        position_local_tail_min_spatial_correlation: float = 0.8,
         normalize_map: bool = False,
         calibration_target: float = 0.5,
         calibration_fraction: float = 0.1,
@@ -118,6 +125,25 @@ class SubspaceAD:
                 小さな異常領域のimage scoreへの寄与を保ちます。Noneで無効化。
             tail_score_gain:
                 tail_score_quantileを超えた分に追加する線形gain。
+            branch_local_tail_quantile:
+                二枝の局所score差分がともに超えたときだけ増幅する正常分位点。
+                単一枝では自動的に無効です。Noneで無効化します。
+            branch_local_tail_gain:
+                二枝で合意した局所tail超過量に掛けるgain。
+            branch_local_tail_min_position_variance:
+                局所tailを有効化する正常score位置分散比の下限。均一textureでは
+                局所強調を行わず、正常な細かい模様の過検出を避けます。
+            branch_local_tail_max_position_variance:
+                正常score位置分散比の上限。強く位置固定された物体では既存の
+                位置PCAを優先し、正常edgeの過強調を避けます。
+            position_local_tail_quantile:
+                空間的に連続した正常構造を持つカテゴリで使う、位置別の局所
+                score差分の正常分位点。Noneで位置別方式を無効化します。
+            position_local_tail_gain:
+                位置別の局所tail超過量に掛けるgain。
+            position_local_tail_min_spatial_correlation:
+                位置別方式へ切り替える正常scoreと3x3近傍scoreの相関下限。
+                下回る場合は二枝の合意を優先します。
             normalize_map:
                 Trueの場合、共通スケーリング後の異常マップをさらに画像ごとに
                 0-1正規化する。画像間で共通の閾値を使う場合はFalseにする。
@@ -170,6 +196,38 @@ class SubspaceAD:
             raise ValueError("tail_score_quantileは0.0から1.0の範囲にしてください。")
         if tail_score_gain < 0.0:
             raise ValueError("tail_score_gainは0.0以上にしてください。")
+        if (
+            branch_local_tail_quantile is not None
+            and not 0.0 <= branch_local_tail_quantile <= 1.0
+        ):
+            raise ValueError(
+                "branch_local_tail_quantileは0.0から1.0の範囲にしてください。"
+            )
+        if branch_local_tail_gain < 0.0:
+            raise ValueError("branch_local_tail_gainは0.0以上にしてください。")
+        if not (
+            0.0 <= branch_local_tail_min_position_variance
+            <= branch_local_tail_max_position_variance
+            <= 1.0
+        ):
+            raise ValueError(
+                "branch local tailの位置分散比範囲は0.0以上1.0以下で、"
+                "min <= maxにしてください。"
+            )
+        if (
+            position_local_tail_quantile is not None
+            and not 0.0 <= position_local_tail_quantile <= 1.0
+        ):
+            raise ValueError(
+                "position_local_tail_quantileは0.0から1.0の範囲にしてください。"
+            )
+        if position_local_tail_gain < 0.0:
+            raise ValueError("position_local_tail_gainは0.0以上にしてください。")
+        if not 0.0 <= position_local_tail_min_spatial_correlation <= 1.0:
+            raise ValueError(
+                "position_local_tail_min_spatial_correlationは"
+                "0.0から1.0の範囲にしてください。"
+            )
         if not 0.0 <= calibration_fraction < 1.0:
             raise ValueError("calibration_fractionは0.0以上1.0未満にしてください。")
         for name, value in (
@@ -195,6 +253,27 @@ class SubspaceAD:
             None if tail_score_quantile is None else float(tail_score_quantile)
         )
         self.tail_score_gain = float(tail_score_gain)
+        self.branch_local_tail_quantile = (
+            None
+            if branch_local_tail_quantile is None
+            else float(branch_local_tail_quantile)
+        )
+        self.branch_local_tail_gain = float(branch_local_tail_gain)
+        self.branch_local_tail_min_position_variance = float(
+            branch_local_tail_min_position_variance
+        )
+        self.branch_local_tail_max_position_variance = float(
+            branch_local_tail_max_position_variance
+        )
+        self.position_local_tail_quantile = (
+            None
+            if position_local_tail_quantile is None
+            else float(position_local_tail_quantile)
+        )
+        self.position_local_tail_gain = float(position_local_tail_gain)
+        self.position_local_tail_min_spatial_correlation = float(
+            position_local_tail_min_spatial_correlation
+        )
         self.normalize_map = normalize_map
         self.calibration_target = float(calibration_target)
         self.calibration_fraction = float(calibration_fraction)
@@ -211,6 +290,7 @@ class SubspaceAD:
         self.n_components_: Optional[int] = None
         self.feature_dim_: Optional[int] = None
         self.position_mean_: Optional[np.ndarray] = None
+        self.patch_grid_: Optional[tuple[int, int]] = None
         self.score_reference_: float = 1.0
         self.multiband_components_: Optional[int] = None
         self.multiband_score_reference_: float = 1.0
@@ -222,6 +302,12 @@ class SubspaceAD:
         self.image_threshold_: float = self.calibration_target
         self.calibration_count_: int = 0
         self.branch_models_: list[SubspaceAD] = []
+        self.branch_local_tail_thresholds_: Optional[np.ndarray] = None
+        self.branch_local_tail_enabled_: bool = False
+        self.position_local_tail_thresholds_: Optional[np.ndarray] = None
+        self.position_local_tail_enabled_: bool = False
+        self.position_variance_ratio_: float = 0.0
+        self.spatial_score_correlation_: float = 0.0
 
     def fit(self, imgs: list[np.ndarray] | str | Path) -> "SubspaceAD":
         """
@@ -249,9 +335,11 @@ class SubspaceAD:
             feat, grid_size = self._extract_patch_features(img)
             extracted.append((feat, grid_size, img.shape[:2]))
 
+        self.patch_grid_ = tuple(extracted[0][1])
         fit_extracted, calibration_extracted = self._split_fit_calibration(extracted)
         if extracted[0][0].ndim == 3:
             self._fit_branches(fit_extracted)
+            self._fit_branch_local_tail(extracted)
             self._fit_score_scale(extracted, calibration_extracted)
             return self
 
@@ -281,6 +369,7 @@ class SubspaceAD:
             raise ValueError("All fit images must return the same patch-token branches.")
 
         self.branch_models_ = []
+        self.patch_grid_ = tuple(extracted[0][1])
         for branch_index in range(branch_count):
             branch = self._new_branch_model()
             branch_extracted = [
@@ -288,6 +377,7 @@ class SubspaceAD:
                 for features, grid_size, output_size in extracted
             ]
             branch._fit_position_center(branch_extracted)
+            branch.patch_grid_ = tuple(branch_extracted[0][1])
             x = np.concatenate(
                 [branch._center_features(item[0]) for item in branch_extracted],
                 axis=0,
@@ -318,6 +408,19 @@ class SubspaceAD:
             multiband_score_weight=self.multiband_score_weight,
             tail_score_quantile=self.tail_score_quantile,
             tail_score_gain=self.tail_score_gain,
+            branch_local_tail_quantile=self.branch_local_tail_quantile,
+            branch_local_tail_gain=self.branch_local_tail_gain,
+            branch_local_tail_min_position_variance=(
+                self.branch_local_tail_min_position_variance
+            ),
+            branch_local_tail_max_position_variance=(
+                self.branch_local_tail_max_position_variance
+            ),
+            position_local_tail_quantile=self.position_local_tail_quantile,
+            position_local_tail_gain=self.position_local_tail_gain,
+            position_local_tail_min_spatial_correlation=(
+                self.position_local_tail_min_spatial_correlation
+            ),
             normalize_map=self.normalize_map,
             calibration_target=self.calibration_target,
             calibration_fraction=0.0,
@@ -911,6 +1014,171 @@ class SubspaceAD:
         weight = self.multiband_score_weight
         return (1.0 - weight) * fine_log + weight * coarse_log
 
+    def _local_score_context(self, scores: np.ndarray) -> np.ndarray:
+        """Return the 3x3 Gaussian neighborhood of one patch-score map."""
+        if self.patch_grid_ is None:
+            raise RuntimeError("patch grid is unavailable for local-tail scoring.")
+        h_p, w_p = self.patch_grid_
+        if scores.size != h_p * w_p:
+            raise ValueError(
+                "patch score count mismatch for local-tail scoring: "
+                f"got {scores.size}, expected {h_p * w_p}"
+            )
+        score_map = scores.reshape(h_p, w_p).astype(np.float32)
+        return cv2.GaussianBlur(score_map, (3, 3), sigmaX=1.0).ravel()
+
+    def _local_score_residual(self, scores: np.ndarray) -> np.ndarray:
+        """Return positive patch-score contrast against a 3x3 neighborhood."""
+        return np.maximum(scores - self._local_score_context(scores), 0.0)
+
+    def _fit_branch_local_tail(
+        self,
+        extracted: list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
+    ) -> None:
+        """Fit a normal-only gate for position or cross-branch local evidence.
+
+        The gate is active only for semi-structured layouts. Homogeneous textures
+        have little position-wise score variance, while rigid aligned objects have
+        a dominant position template; both cases are better served by the base
+        position-PCA score. Spatially coherent layouts use a per-position normal
+        tail; the remaining eligible layouts require agreement between branches.
+        """
+        self.branch_local_tail_thresholds_ = None
+        self.branch_local_tail_enabled_ = False
+        self.position_local_tail_thresholds_ = None
+        self.position_local_tail_enabled_ = False
+        self.position_variance_ratio_ = 0.0
+        self.spatial_score_correlation_ = 0.0
+        branch_available = (
+            self.branch_local_tail_quantile is not None
+            and self.branch_local_tail_gain > 0.0
+        )
+        position_available = (
+            self.position_local_tail_quantile is not None
+            and self.position_local_tail_gain > 0.0
+        )
+        if len(self.branch_models_) < 2 or not (
+            branch_available or position_available
+        ):
+            return
+
+        scores_by_image = []
+        for features, grid_size, _ in extracted:
+            if tuple(grid_size) != self.patch_grid_:
+                raise ValueError("All fit images must use one patch grid.")
+            if features.ndim != 3 or features.shape[0] != len(self.branch_models_):
+                raise ValueError("Invalid feature branches for local-tail fitting.")
+            scores_by_image.append(np.stack([
+                branch._score_features(features[index])
+                for index, branch in enumerate(self.branch_models_)
+            ]))
+
+        branch_scores = np.stack(scores_by_image).astype(np.float32)
+        fused_scores = np.mean(branch_scores, axis=1)
+        total_variance = float(np.var(fused_scores))
+        if total_variance > self.eps:
+            self.position_variance_ratio_ = float(
+                np.var(np.mean(fused_scores, axis=0)) / total_variance
+            )
+
+        contexts = np.stack([
+            self._local_score_context(scores) for scores in fused_scores
+        ])
+        centered_scores = fused_scores.ravel() - float(np.mean(fused_scores))
+        centered_contexts = contexts.ravel() - float(np.mean(contexts))
+        correlation_scale = float(np.sqrt(
+            np.sum(centered_scores * centered_scores)
+            * np.sum(centered_contexts * centered_contexts)
+        ))
+        if correlation_scale > self.eps:
+            self.spatial_score_correlation_ = float(
+                np.sum(centered_scores * centered_contexts) / correlation_scale
+            )
+
+        eligible = (
+            self.branch_local_tail_min_position_variance
+            <= self.position_variance_ratio_
+            <= self.branch_local_tail_max_position_variance
+        )
+        if (
+            eligible
+            and position_available
+            and self.spatial_score_correlation_
+            >= self.position_local_tail_min_spatial_correlation
+        ):
+            local_residuals = np.stack([
+                self._local_score_residual(scores) for scores in fused_scores
+            ])
+            self.position_local_tail_thresholds_ = np.quantile(
+                local_residuals,
+                self.position_local_tail_quantile,
+                axis=0,
+            ).astype(np.float32)
+            self.position_local_tail_enabled_ = True
+        elif eligible and branch_available:
+            thresholds = []
+            for branch_index in range(branch_scores.shape[1]):
+                local_residuals = np.concatenate([
+                    self._local_score_residual(scores)
+                    for scores in branch_scores[:, branch_index]
+                ])
+                thresholds.append(float(np.quantile(
+                    local_residuals,
+                    self.branch_local_tail_quantile,
+                )))
+            self.branch_local_tail_thresholds_ = np.asarray(
+                thresholds,
+                dtype=np.float32,
+            )
+            self.branch_local_tail_enabled_ = True
+
+        mode = "position" if self.position_local_tail_enabled_ else (
+            "branch" if self.branch_local_tail_enabled_ else "disabled"
+        )
+        print(
+            "Adaptive local-tail fitted: "
+            f"position_variance_ratio={self.position_variance_ratio_:.6g}, "
+            f"spatial_correlation={self.spatial_score_correlation_:.6g}, "
+            f"mode={mode}"
+        )
+
+    def _fuse_branch_scores(self, branch_scores: list[np.ndarray]) -> np.ndarray:
+        """Fuse independent branch scores and optional agreed local-tail evidence."""
+        stacked = np.stack(branch_scores, axis=0)
+        scores = np.mean(stacked, axis=0)
+        position_thresholds = self.position_local_tail_thresholds_
+        if (
+            self.position_local_tail_enabled_
+            and position_thresholds is not None
+            and position_thresholds.size == scores.size
+        ):
+            scores = scores + self.position_local_tail_gain * np.maximum(
+                self._local_score_residual(scores) - position_thresholds,
+                0.0,
+            )
+            return scores.astype(np.float32)
+
+        thresholds = self.branch_local_tail_thresholds_
+        if (
+            not self.branch_local_tail_enabled_
+            or thresholds is None
+            or thresholds.size != stacked.shape[0]
+        ):
+            return scores.astype(np.float32)
+
+        local_evidence = np.stack([
+            np.maximum(
+                self._local_score_residual(branch_score) - thresholds[index],
+                0.0,
+            )
+            for index, branch_score in enumerate(branch_scores)
+        ])
+        scores = scores + self.branch_local_tail_gain * np.min(
+            local_evidence,
+            axis=0,
+        )
+        return scores.astype(np.float32)
+
     def _score_features(self, X: np.ndarray) -> np.ndarray:
         """Use PCA reconstruction residuals as patch anomaly scores."""
         self._check_fitted()
@@ -923,7 +1191,7 @@ class SubspaceAD:
                 model._score_features(X[index])
                 for index, model in enumerate(self.branch_models_)
             ]
-            return np.mean(np.stack(branch_scores, axis=0), axis=0).astype(np.float32)
+            return self._fuse_branch_scores(branch_scores)
 
         centered = self._center_features(X)
         fine_scores, coarse_scores = self._squared_spe_bands_centered(centered)
@@ -976,6 +1244,19 @@ class SubspaceAD:
             "multiband_score_weight": self.multiband_score_weight,
             "tail_score_quantile": self.tail_score_quantile,
             "tail_score_gain": self.tail_score_gain,
+            "branch_local_tail_quantile": self.branch_local_tail_quantile,
+            "branch_local_tail_gain": self.branch_local_tail_gain,
+            "branch_local_tail_min_position_variance": (
+                self.branch_local_tail_min_position_variance
+            ),
+            "branch_local_tail_max_position_variance": (
+                self.branch_local_tail_max_position_variance
+            ),
+            "position_local_tail_quantile": self.position_local_tail_quantile,
+            "position_local_tail_gain": self.position_local_tail_gain,
+            "position_local_tail_min_spatial_correlation": (
+                self.position_local_tail_min_spatial_correlation
+            ),
             "normalize_map": self.normalize_map,
             "calibration_target": self.calibration_target,
             "calibration_fraction": self.calibration_fraction,
@@ -990,6 +1271,7 @@ class SubspaceAD:
             "n_components": self.n_components_,
             "feature_dim": self.feature_dim_,
             "position_mean": self.position_mean_,
+            "patch_grid": self.patch_grid_,
             "score_reference": self.score_reference_,
             "multiband_components": self.multiband_components_,
             "multiband_score_reference": self.multiband_score_reference_,
@@ -1000,6 +1282,12 @@ class SubspaceAD:
             "threshold": self.threshold_,
             "image_threshold": self.image_threshold_,
             "calibration_count": self.calibration_count_,
+            "branch_local_tail_thresholds": self.branch_local_tail_thresholds_,
+            "branch_local_tail_enabled": self.branch_local_tail_enabled_,
+            "position_local_tail_thresholds": self.position_local_tail_thresholds_,
+            "position_local_tail_enabled": self.position_local_tail_enabled_,
+            "position_variance_ratio": self.position_variance_ratio_,
+            "spatial_score_correlation": self.spatial_score_correlation_,
         }
 
     def save_npz(self, npz_path: str | Path) -> None:
@@ -1015,7 +1303,7 @@ class SubspaceAD:
         state = self.state_dict()
         is_multi_branch = bool(state["branches"])
         metadata = {
-            "format_version": 5,
+            "format_version": 6,
             "model_name": str(state["model_name"]),
             "pca_ev": (
                 None if state["pca_ev"] is None else float(state["pca_ev"])
@@ -1039,6 +1327,62 @@ class SubspaceAD:
                 else float(state["tail_score_quantile"])
             ),
             "tail_score_gain": float(state["tail_score_gain"]),
+            "branch_local_tail_quantile": (
+                None
+                if state["branch_local_tail_quantile"] is None
+                else float(state["branch_local_tail_quantile"])
+            ),
+            "branch_local_tail_gain": float(state["branch_local_tail_gain"]),
+            "branch_local_tail_min_position_variance": float(
+                state["branch_local_tail_min_position_variance"]
+            ),
+            "branch_local_tail_max_position_variance": float(
+                state["branch_local_tail_max_position_variance"]
+            ),
+            "position_local_tail_quantile": (
+                None
+                if state["position_local_tail_quantile"] is None
+                else float(state["position_local_tail_quantile"])
+            ),
+            "position_local_tail_gain": float(
+                state["position_local_tail_gain"]
+            ),
+            "position_local_tail_min_spatial_correlation": float(
+                state["position_local_tail_min_spatial_correlation"]
+            ),
+            "patch_grid": (
+                None
+                if state["patch_grid"] is None
+                else [int(value) for value in state["patch_grid"]]
+            ),
+            "branch_local_tail_thresholds": (
+                None
+                if state["branch_local_tail_thresholds"] is None
+                else [
+                    float(value)
+                    for value in state["branch_local_tail_thresholds"]
+                ]
+            ),
+            "branch_local_tail_enabled": bool(
+                state["branch_local_tail_enabled"]
+            ),
+            "position_local_tail_thresholds": (
+                None
+                if state["position_local_tail_thresholds"] is None
+                else [
+                    float(value)
+                    for value in state["position_local_tail_thresholds"]
+                ]
+            ),
+            "position_local_tail_enabled": bool(
+                state["position_local_tail_enabled"]
+            ),
+            "position_variance_ratio": float(
+                state["position_variance_ratio"]
+            ),
+            "spatial_score_correlation": float(
+                state["spatial_score_correlation"]
+            ),
             "normalize_map": bool(state["normalize_map"]),
             "calibration_target": float(state["calibration_target"]),
             "calibration_fraction": float(state["calibration_fraction"]),
@@ -1122,14 +1466,14 @@ class SubspaceAD:
                 raise ValueError("Invalid SubspaceAD NPZ metadata.")
 
             format_version = metadata.get("format_version")
-            if format_version not in {1, 2, 3, 4, 5}:
+            if format_version not in {1, 2, 3, 4, 5, 6}:
                 raise ValueError(
                     "Unsupported SubspaceAD NPZ format version: "
                     f"{metadata.get('format_version')!r}"
                 )
 
             is_multi_branch = format_version == 4 or (
-                format_version == 5 and "branch_metadata" in metadata
+                format_version >= 5 and "branch_metadata" in metadata
             )
             if is_multi_branch:
                 branch_metadata = metadata.pop("branch_metadata", None)
@@ -1181,6 +1525,22 @@ class SubspaceAD:
                     "multiband_score_weight": 0.0,
                     "tail_score_quantile": None,
                     "tail_score_gain": 0.0,
+                })
+            # Versions 1-5 predate adaptive branch-local tail scoring. Keep
+            # their original score exactly when loading historical files.
+            if format_version < 6:
+                state.update({
+                    "branch_local_tail_quantile": None,
+                    "branch_local_tail_gain": 0.0,
+                    "branch_local_tail_enabled": False,
+                    "branch_local_tail_thresholds": None,
+                    "position_local_tail_quantile": None,
+                    "position_local_tail_gain": 0.0,
+                    "position_local_tail_enabled": False,
+                    "position_local_tail_thresholds": None,
+                    "position_variance_ratio": 0.0,
+                    "spatial_score_correlation": 0.0,
+                    "patch_grid": None,
                 })
 
         self.load_state_dict(state)
@@ -1268,6 +1628,35 @@ class SubspaceAD:
         if self.tail_score_quantile is not None:
             self.tail_score_quantile = float(self.tail_score_quantile)
         self.tail_score_gain = float(state.get("tail_score_gain", 0.0))
+        self.branch_local_tail_quantile = state.get(
+            "branch_local_tail_quantile"
+        )
+        if self.branch_local_tail_quantile is not None:
+            self.branch_local_tail_quantile = float(
+                self.branch_local_tail_quantile
+            )
+        self.branch_local_tail_gain = float(
+            state.get("branch_local_tail_gain", 0.0)
+        )
+        self.branch_local_tail_min_position_variance = float(
+            state.get("branch_local_tail_min_position_variance", 0.1)
+        )
+        self.branch_local_tail_max_position_variance = float(
+            state.get("branch_local_tail_max_position_variance", 0.5)
+        )
+        self.position_local_tail_quantile = state.get(
+            "position_local_tail_quantile"
+        )
+        if self.position_local_tail_quantile is not None:
+            self.position_local_tail_quantile = float(
+                self.position_local_tail_quantile
+            )
+        self.position_local_tail_gain = float(
+            state.get("position_local_tail_gain", 0.0)
+        )
+        self.position_local_tail_min_spatial_correlation = float(
+            state.get("position_local_tail_min_spatial_correlation", 0.8)
+        )
         self.normalize_map = state["normalize_map"]
         self.calibration_target = float(
             state["calibration_target"] if "calibration_target" in state else 0.5
@@ -1295,6 +1684,12 @@ class SubspaceAD:
         self.n_components_ = state.get("n_components")
         self.feature_dim_ = state.get("feature_dim")
         self.position_mean_ = state.get("position_mean")
+        patch_grid = state.get("patch_grid")
+        self.patch_grid_ = (
+            None
+            if patch_grid is None
+            else (int(patch_grid[0]), int(patch_grid[1]))
+        )
         self.score_reference_ = float(
             state.get(
                 "score_reference",
@@ -1320,3 +1715,27 @@ class SubspaceAD:
         self.threshold_ = float(state.get("threshold", 0.5))
         self.image_threshold_ = float(state.get("image_threshold", 0.5))
         self.calibration_count_ = int(state.get("calibration_count", 0))
+        branch_local_thresholds = state.get("branch_local_tail_thresholds")
+        self.branch_local_tail_thresholds_ = (
+            None
+            if branch_local_thresholds is None
+            else np.asarray(branch_local_thresholds, dtype=np.float32)
+        )
+        self.branch_local_tail_enabled_ = bool(
+            state.get("branch_local_tail_enabled", False)
+        )
+        position_local_thresholds = state.get("position_local_tail_thresholds")
+        self.position_local_tail_thresholds_ = (
+            None
+            if position_local_thresholds is None
+            else np.asarray(position_local_thresholds, dtype=np.float32)
+        )
+        self.position_local_tail_enabled_ = bool(
+            state.get("position_local_tail_enabled", False)
+        )
+        self.position_variance_ratio_ = float(
+            state.get("position_variance_ratio", 0.0)
+        )
+        self.spatial_score_correlation_ = float(
+            state.get("spatial_score_correlation", 0.0)
+        )

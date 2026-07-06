@@ -126,6 +126,92 @@ class ScoringTests(unittest.TestCase):
             atol=1e-6,
         )
 
+    def test_branch_local_tail_adds_only_agreed_local_evidence(self) -> None:
+        model = SubspaceAD(
+            "dual.onnx",
+            dino=object(),
+            pca_dim=1,
+            branch_local_tail_gain=1.0,
+        )
+        model.patch_grid_ = (2, 2)
+        model.branch_local_tail_enabled_ = True
+        model.branch_local_tail_thresholds_ = np.zeros(2, dtype=np.float32)
+        branch_scores = [
+            np.array([0.0, 0.0, 0.0, 4.0], dtype=np.float32),
+            np.array([0.0, 0.0, 0.0, 2.0], dtype=np.float32),
+        ]
+        expected = np.mean(np.stack(branch_scores), axis=0)
+        expected += np.minimum(
+            model._local_score_residual(branch_scores[0]),
+            model._local_score_residual(branch_scores[1]),
+        )
+
+        np.testing.assert_allclose(
+            model._fuse_branch_scores(branch_scores),
+            expected,
+        )
+
+    def test_branch_local_tail_uses_normal_position_variance_gate(self) -> None:
+        class ScoreBranch:
+            mean_ = np.ones((1, 1))
+            components_ = np.ones((1, 1))
+
+            @staticmethod
+            def _score_features(features: np.ndarray) -> np.ndarray:
+                return features[:, 0].astype(np.float32)
+
+        model = SubspaceAD(
+            "dual.onnx",
+            dino=object(),
+            pca_dim=1,
+            branch_local_tail_min_position_variance=0.1,
+            branch_local_tail_max_position_variance=0.5,
+            position_local_tail_quantile=None,
+        )
+        model.branch_models_ = [ScoreBranch(), ScoreBranch()]
+        model.patch_grid_ = (2, 2)
+        position_pattern = np.array([0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+        extracted = []
+        for image_offset in (-1.0, 1.0):
+            scores = position_pattern + image_offset
+            features = np.stack((scores, scores))[:, :, None]
+            extracted.append((features, (2, 2), (8, 8)))
+
+        model._fit_branch_local_tail(extracted)
+
+        self.assertAlmostEqual(model.position_variance_ratio_, 0.2, places=6)
+        self.assertTrue(model.branch_local_tail_enabled_)
+        self.assertEqual(model.branch_local_tail_thresholds_.shape, (2,))
+
+    def test_position_local_tail_uses_position_specific_thresholds(self) -> None:
+        model = SubspaceAD(
+            "dual.onnx",
+            dino=object(),
+            pca_dim=1,
+            position_local_tail_gain=0.5,
+        )
+        model.patch_grid_ = (2, 2)
+        model.position_local_tail_enabled_ = True
+        model.position_local_tail_thresholds_ = np.array(
+            [0.0, 0.0, 0.0, 0.25],
+            dtype=np.float32,
+        )
+        branch_scores = [
+            np.array([0.0, 0.0, 0.0, 4.0], dtype=np.float32),
+            np.array([0.0, 0.0, 0.0, 2.0], dtype=np.float32),
+        ]
+        base = np.mean(np.stack(branch_scores), axis=0)
+        expected = base + 0.5 * np.maximum(
+            model._local_score_residual(base)
+            - model.position_local_tail_thresholds_,
+            0.0,
+        )
+
+        np.testing.assert_allclose(
+            model._fuse_branch_scores(branch_scores),
+            expected,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

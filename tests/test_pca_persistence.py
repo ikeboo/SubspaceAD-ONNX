@@ -37,6 +37,7 @@ class PcaPersistenceTests(unittest.TestCase):
         )
         model._fit_pca(features)
         model.position_mean_ = np.arange(6, dtype=np.float32).reshape(2, 3)
+        model.patch_grid_ = (1, 2)
         model.score_reference_ = 0.125
         model.multiband_score_reference_ = 0.25
         model.tail_score_reference_ = 1.5
@@ -46,6 +47,16 @@ class PcaPersistenceTests(unittest.TestCase):
         model.threshold_ = 0.35
         model.image_threshold_ = 0.45
         model.calibration_count_ = 3
+        model.branch_local_tail_thresholds_ = np.array(
+            [0.2, 0.4], dtype=np.float32
+        )
+        model.branch_local_tail_enabled_ = True
+        model.position_local_tail_thresholds_ = np.array(
+            [0.1, 0.2], dtype=np.float32
+        )
+        model.position_local_tail_enabled_ = True
+        model.position_variance_ratio_ = 0.25
+        model.spatial_score_correlation_ = 0.85
         return model
 
     def test_save_and_load_npz_round_trip(self) -> None:
@@ -82,6 +93,7 @@ class PcaPersistenceTests(unittest.TestCase):
         np.testing.assert_array_equal(
             restored.position_mean_, original.position_mean_
         )
+        self.assertEqual(restored.patch_grid_, original.patch_grid_)
         self.assertEqual(restored.normalize_map, original.normalize_map)
         self.assertEqual(restored.calibration_target, original.calibration_target)
         self.assertEqual(restored.blur, original.blur)
@@ -107,6 +119,46 @@ class PcaPersistenceTests(unittest.TestCase):
         self.assertEqual(restored.threshold_, original.threshold_)
         self.assertEqual(restored.image_threshold_, original.image_threshold_)
         self.assertEqual(restored.calibration_count_, original.calibration_count_)
+        self.assertEqual(
+            restored.branch_local_tail_quantile,
+            original.branch_local_tail_quantile,
+        )
+        self.assertEqual(
+            restored.branch_local_tail_gain,
+            original.branch_local_tail_gain,
+        )
+        np.testing.assert_array_equal(
+            restored.branch_local_tail_thresholds_,
+            original.branch_local_tail_thresholds_,
+        )
+        self.assertEqual(
+            restored.branch_local_tail_enabled_,
+            original.branch_local_tail_enabled_,
+        )
+        self.assertEqual(
+            restored.position_local_tail_quantile,
+            original.position_local_tail_quantile,
+        )
+        self.assertEqual(
+            restored.position_local_tail_gain,
+            original.position_local_tail_gain,
+        )
+        np.testing.assert_array_equal(
+            restored.position_local_tail_thresholds_,
+            original.position_local_tail_thresholds_,
+        )
+        self.assertEqual(
+            restored.position_local_tail_enabled_,
+            original.position_local_tail_enabled_,
+        )
+        self.assertEqual(
+            restored.position_variance_ratio_,
+            original.position_variance_ratio_,
+        )
+        self.assertEqual(
+            restored.spatial_score_correlation_,
+            original.spatial_score_correlation_,
+        )
 
     def test_save_npz_requires_fitted_model(self) -> None:
         model = SubspaceAD("model.onnx", dino=object())
@@ -211,6 +263,14 @@ class PcaPersistenceTests(unittest.TestCase):
             features = rng.normal(size=(2, 4, 6)).astype(np.float32)
             extracted.append((features, (2, 2), (8, 8)))
         original._fit_branches(extracted)
+        original.position_local_tail_thresholds_ = np.full(
+            4,
+            0.1,
+            dtype=np.float32,
+        )
+        original.position_local_tail_enabled_ = True
+        original.position_variance_ratio_ = 0.2
+        original.spatial_score_correlation_ = 0.9
         original.score_offset_ = 0.2
         original.score_scale_ = 0.3
 
@@ -227,6 +287,47 @@ class PcaPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(restored.score_offset_, original.score_offset_)
         self.assertEqual(restored.score_scale_, original.score_scale_)
+
+    def test_version_five_disables_branch_local_scoring(self) -> None:
+        original = SubspaceAD(
+            "dual.onnx",
+            dino=object(),
+            pca_ev=None,
+            pca_dim=2,
+            score_transform="log",
+        )
+        rng = np.random.default_rng(5)
+        extracted = [
+            (rng.normal(size=(2, 4, 6)).astype(np.float32), (2, 2), (8, 8))
+            for _ in range(5)
+        ]
+        original._fit_branches(extracted)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            v6_path = Path(temp_dir) / "dual-v6.npz"
+            v5_path = Path(temp_dir) / "dual-v5.npz"
+            original.save_npz(v6_path)
+            with np.load(v6_path, allow_pickle=False) as saved:
+                arrays = {
+                    key: np.array(saved[key], copy=True)
+                    for key in saved.files
+                }
+            metadata = json.loads(str(arrays["metadata"].item()))
+            metadata["format_version"] = 5
+            arrays["metadata"] = np.asarray(json.dumps(metadata))
+            np.savez_compressed(v5_path, **arrays)
+
+            restored = SubspaceAD("dual.onnx", dino=object()).load_npz(v5_path)
+
+        self.assertIsNone(restored.branch_local_tail_quantile)
+        self.assertEqual(restored.branch_local_tail_gain, 0.0)
+        self.assertFalse(restored.branch_local_tail_enabled_)
+        self.assertIsNone(restored.branch_local_tail_thresholds_)
+        self.assertIsNone(restored.position_local_tail_quantile)
+        self.assertEqual(restored.position_local_tail_gain, 0.0)
+        self.assertFalse(restored.position_local_tail_enabled_)
+        self.assertIsNone(restored.position_local_tail_thresholds_)
+        self.assertIsNone(restored.patch_grid_)
 
 
 if __name__ == "__main__":
