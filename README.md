@@ -141,9 +141,12 @@ legacy_model = SubspaceAD(
 )
 ```
 
-`score_transform` also accepts `"sqrt"`. Version-5 NPZ files persist the
-multi-band and tail statistics. Version-1 through version-4 files remain
-loadable with their historical scoring behavior.
+`score_transform` also accepts `"sqrt"`. Version-7 NPZ files also persist the
+adaptive local-tail and shared-PPCA-mixture statistics. Older NPZ versions
+remain loadable with their historical scoring behavior.
+
+The default `mixture_components=2` uses a gated two-mode normal model with a
+shared PCA projection. Set `mixture_components=1` to disable it.
 
 ## Image mask prediction
 
@@ -202,9 +205,11 @@ DINOv3-ViT-S+ Middle-7 model gave the following macro averages:
 |---|---:|---:|---:|---:|---:|
 | Global PCA + squared SPE | 0.95421 | 0.97498 | 0.97650 | 0.91787 | 268.1s |
 | Spatial PCA + legacy log-SPE | **0.95903** | **0.97952** | **0.98018** | 0.92446 | 263.7s |
-| Spatial PCA + calibrated log-SPE (current) | 0.95875 | 0.97908 | 0.98015 | **0.92493** | **255.9s** |
+| Spatial PCA + calibrated log-SPE | 0.95875 | 0.97908 | 0.98015 | **0.92493** | **255.9s** |
 | Dual 2–5 / 6–9 independent PCA + score mean | **0.96394** | **0.98326** | **0.98290** | **0.93334** | — |
 | Dual + 95/99% multi-band SPE + normal-tail gain | **0.96485** | **0.98335** | **0.98330** | **0.93502** | — |
+| Dual + adaptive local tail | **0.96687** | **0.98446** | **0.98338** | **0.93605** | — |
+| Dual + adaptive shared-PPCA mixture (current) | **0.96809** | **0.98545** | **0.98388** | **0.93756** | — |
 
 The calibrated version fixes anomaly-map contrast and learns usable operating
 thresholds; its four macro metrics remain above the original global-PCA
@@ -221,6 +226,8 @@ single-output pruned graph in a same-process 100-run CPU benchmark. Its full
 [`outputs/dual_branch_vitsplus_224.csv`](outputs/dual_branch_vitsplus_224.csv).
 The multi-band/tail result is in
 [`outputs/subspacead_multiband_v5_224.csv`](outputs/subspacead_multiband_v5_224.csv).
+The current shared-PPCA-mixture result is in
+[`outputs/shared_ppca_mixture_v7_224.csv`](outputs/shared_ppca_mixture_v7_224.csv).
 
 See [inference.ipynb](inference.ipynb) for additional visualization and examples of saving and restoring the PCA parameters.
 

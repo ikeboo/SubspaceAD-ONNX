@@ -1,0 +1,13 @@
+date,datasets,img_auroc,img_aupr,seg_auroc,seg_pro,description
+2026-07-06 16:43:16,bottle,1.00000,1.00000,0.98814,0.94913,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,capsule,0.95612,0.98990,0.98870,0.95364,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,carpet,0.99960,0.99988,0.99400,0.97065,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,grid,0.99916,0.99970,0.98881,0.96682,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,hazelnut,0.99964,0.99980,0.99143,0.96212,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,leather,1.00000,1.00000,0.99439,0.98355,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,screw,0.80139,0.92296,0.97901,0.91301,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,tile,1.00000,1.00000,0.97859,0.93385,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,toothbrush,0.92778,0.96595,0.99152,0.92947,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,transistor,0.97583,0.96500,0.96278,0.81572,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,wood,0.98947,0.99675,0.96535,0.93518,shared_ppca_mixture_v7_224
+2026-07-06 16:43:16,average,0.96809,0.98545,0.98388,0.93756,shared_ppca_mixture_v7_224;bottle;capsule;carpet;grid;hazelnut;leather;screw;tile;toothbrush;transistor;wood

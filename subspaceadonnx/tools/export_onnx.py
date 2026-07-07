@@ -1,5 +1,5 @@
 '''
-python subspaceadonnx/tools/export_onnx.py --model-name facebook/dinov3-vitb16-pretrain-lvd1689m --output models/dinov3_vitb_middle7.onnx --height 448 --width 448
+python subspaceadonnx/tools/export_onnx.py --model-name facebook/dinov3-vits16plus-pretrain-lvd1689m --output models/dinov3_vitsplus_448_3-6_7-10.onnx --height 448 --width 448 --layer-groups '3,4,5,6;7,8,9,10'
 
 '''
 from __future__ import annotations

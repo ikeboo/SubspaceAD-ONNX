@@ -60,6 +60,11 @@ class SubspaceAD:
         feature_l2_normalize: bool = False,
         branch_fusion: str = "mean",
         spatial_centering: float = 1.0,
+        mixture_components: int = 2,
+        mixture_descriptor_grid: int = 4,
+        mixture_min_separation: float = 0.08,
+        mixture_min_fraction: float = 0.15,
+        mixture_min_images: int = 8,
         score_transform: str = "log",
         multiband_pca_ev: Optional[float] = 0.95,
         multiband_score_weight: float = 0.25,
@@ -110,6 +115,19 @@ class SubspaceAD:
                 各patch位置の正常特徴平均をPCA前に差し引く強さ。0.0は従来の
                 global PCA、1.0は完全な位置中心化です。特徴そのものは保持せず、
                 位置ごとの平均だけを保存します。
+            mixture_components:
+                正常画像の空間的な外観を最大いくつのモードで表すか。2の場合、
+                低解像度化したpatch特徴を2-meansで分け、十分に分離したときだけ
+                モード別の位置平均を使います。PCA部分空間は共有します。
+            mixture_descriptor_grid:
+                正常モードの選択に使うpatch特徴の空間poolingサイズ。
+            mixture_min_separation:
+                2モードを有効にするbetween/total分散比の下限。
+            mixture_min_fraction:
+                各モードに必要な正常画像割合の下限。
+            mixture_min_images:
+                各モードに必要な正常画像数の下限。few-shot時は、全画像を2群に
+                分けられるよう自動的に緩和されます。
             score_transform:
                 PCA残差に適用する単調変換。"squared"、"sqrt"、"log"から選択。
                 logは大きな正常残差の影響を抑え、局所異常を見やすくします。
@@ -180,6 +198,16 @@ class SubspaceAD:
             raise ValueError("calibration_targetは0より大きい値にしてください。")
         if not 0.0 <= spatial_centering <= 1.0:
             raise ValueError("spatial_centeringは0.0から1.0の範囲にしてください。")
+        if mixture_components not in {1, 2}:
+            raise ValueError("mixture_componentsは1または2にしてください。")
+        if mixture_descriptor_grid < 1:
+            raise ValueError("mixture_descriptor_gridは1以上にしてください。")
+        if not 0.0 <= mixture_min_separation <= 1.0:
+            raise ValueError("mixture_min_separationは0.0から1.0の範囲にしてください。")
+        if not 0.0 < mixture_min_fraction <= 0.5:
+            raise ValueError("mixture_min_fractionは0.0より大きく0.5以下にしてください。")
+        if mixture_min_images < 1:
+            raise ValueError("mixture_min_imagesは1以上にしてください。")
         if score_transform not in {"squared", "sqrt", "log"}:
             raise ValueError(
                 "score_transformは'squared'、'sqrt'、'log'のいずれかにしてください。"
@@ -244,6 +272,11 @@ class SubspaceAD:
         self.feature_l2_normalize = feature_l2_normalize
         self.branch_fusion = branch_fusion
         self.spatial_centering = float(spatial_centering)
+        self.mixture_components = int(mixture_components)
+        self.mixture_descriptor_grid = int(mixture_descriptor_grid)
+        self.mixture_min_separation = float(mixture_min_separation)
+        self.mixture_min_fraction = float(mixture_min_fraction)
+        self.mixture_min_images = int(mixture_min_images)
         self.score_transform = score_transform
         self.multiband_pca_ev = (
             None if multiband_pca_ev is None else float(multiband_pca_ev)
@@ -290,6 +323,10 @@ class SubspaceAD:
         self.n_components_: Optional[int] = None
         self.feature_dim_: Optional[int] = None
         self.position_mean_: Optional[np.ndarray] = None
+        self.mixture_position_means_: Optional[np.ndarray] = None
+        self.mixture_descriptor_centers_: Optional[np.ndarray] = None
+        self.mixture_separation_: float = 0.0
+        self.mixture_cluster_sizes_: Optional[np.ndarray] = None
         self.patch_grid_: Optional[tuple[int, int]] = None
         self.score_reference_: float = 1.0
         self.multiband_components_: Optional[int] = None
@@ -403,6 +440,11 @@ class SubspaceAD:
             max_fit_tokens=self.max_fit_tokens,
             feature_l2_normalize=self.feature_l2_normalize,
             spatial_centering=self.spatial_centering,
+            mixture_components=self.mixture_components,
+            mixture_descriptor_grid=self.mixture_descriptor_grid,
+            mixture_min_separation=self.mixture_min_separation,
+            mixture_min_fraction=self.mixture_min_fraction,
+            mixture_min_images=self.mixture_min_images,
             score_transform=self.score_transform,
             multiband_pca_ev=self.multiband_pca_ev,
             multiband_score_weight=self.multiband_score_weight,
@@ -466,11 +508,11 @@ class SubspaceAD:
         self,
         extracted: list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
     ) -> None:
-        """Fit a compact position-conditioned normal mean.
+        """Fit position-conditioned normal means, optionally as two modes.
 
-        A single mean vector per patch position captures the expected object layout
-        without retaining any training tokens.  Interpolating it with the global
-        mean makes ``spatial_centering=0`` exactly equivalent to global centering.
+        A small hard mixture captures discrete normal layouts without retaining
+        training tokens.  The modes share one PCA loading matrix, so fitting still
+        needs one eigendecomposition and inference still needs one projection.
         """
         first_features, first_grid, _ = extracted[0]
         n_patches, feature_dim = first_features.shape
@@ -492,6 +534,137 @@ class SubspaceAD:
             + self.spatial_centering * (position_mean - global_mean)
         ).astype(np.float32)
 
+        self.mixture_position_means_ = None
+        self.mixture_descriptor_centers_ = None
+        self.mixture_separation_ = 0.0
+        self.mixture_cluster_sizes_ = None
+        if self.mixture_components < 2 or len(extracted) < 4:
+            return
+
+        descriptors = np.stack([
+            self._mixture_descriptor(features, first_grid)
+            for features, _, _ in extracted
+        ]).astype(np.float64)
+        labels, centers, separation = self._fit_two_means(descriptors)
+        cluster_sizes = np.bincount(labels, minlength=2)
+        required_images = min(
+            self.mixture_min_images,
+            max(1, len(extracted) // 4),
+        )
+        required_images = max(
+            required_images,
+            int(math.ceil(len(extracted) * self.mixture_min_fraction)),
+        )
+        enabled = (
+            separation >= self.mixture_min_separation
+            and int(np.min(cluster_sizes)) >= required_images
+        )
+        self.mixture_separation_ = float(separation)
+        self.mixture_cluster_sizes_ = cluster_sizes.astype(np.int32)
+        print(
+            "Shared-PPCA mixture candidate: "
+            f"separation={self.mixture_separation_:.6g}, "
+            f"cluster_sizes={cluster_sizes.tolist()}, enabled={enabled}"
+        )
+        if not enabled:
+            return
+
+        mode_means = []
+        for mode in range(2):
+            mode_features = [
+                features
+                for (features, _, _), label in zip(extracted, labels)
+                if label == mode
+            ]
+            raw_mode_mean = np.mean(mode_features, axis=0, dtype=np.float64)
+            mode_means.append(
+                global_mean
+                + self.spatial_centering * (raw_mode_mean - global_mean)
+            )
+        self.mixture_position_means_ = np.stack(mode_means).astype(np.float32)
+        self.mixture_descriptor_centers_ = centers.astype(np.float32)
+
+    def _mixture_descriptor(
+        self,
+        features: np.ndarray,
+        grid_size: tuple[int, int] | None = None,
+    ) -> np.ndarray:
+        """Return a compact spatial descriptor for normal-mode selection."""
+        if grid_size is None:
+            grid_size = self.patch_grid_
+        if grid_size is None:
+            raise RuntimeError("patch grid is unavailable for mixture scoring.")
+        h_p, w_p = grid_size
+        if features.shape[0] != h_p * w_p:
+            raise ValueError(
+                "patch feature count mismatch for mixture scoring: "
+                f"got {features.shape[0]}, expected {h_p * w_p}"
+            )
+        feature_map = features.reshape(h_p, w_p, features.shape[-1])
+        size = min(self.mixture_descriptor_grid, h_p, w_p)
+        if (h_p, w_p) != (size, size):
+            # OpenCV builds commonly cap image channels at four for resize;
+            # patch embeddings have hundreds. Explicit area bins are tiny
+            # (at most 14x14 here) and keep this operation backend-independent.
+            row_edges = np.linspace(0, h_p, size + 1, dtype=np.int32)
+            col_edges = np.linspace(0, w_p, size + 1, dtype=np.int32)
+            pooled = np.empty(
+                (size, size, feature_map.shape[-1]),
+                dtype=np.float64,
+            )
+            for row in range(size):
+                for col in range(size):
+                    pooled[row, col] = np.mean(
+                        feature_map[
+                            row_edges[row]:row_edges[row + 1],
+                            col_edges[col]:col_edges[col + 1],
+                        ],
+                        axis=(0, 1),
+                    )
+        else:
+            pooled = feature_map
+        descriptor = pooled.reshape(-1).astype(np.float64)
+        norm = float(np.linalg.norm(descriptor))
+        if norm > self.eps:
+            descriptor /= norm
+        return descriptor
+
+    def _fit_two_means(
+        self,
+        descriptors: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        """Fit deterministic balanced-enough 2-means and report variance gain."""
+        mean = np.mean(descriptors, axis=0)
+        first = int(np.argmax(np.sum((descriptors - mean) ** 2, axis=1)))
+        second = int(np.argmax(
+            np.sum((descriptors - descriptors[first]) ** 2, axis=1)
+        ))
+        centers = descriptors[[first, second]].copy()
+        labels = np.zeros(descriptors.shape[0], dtype=np.int32)
+        for _ in range(20):
+            distances = np.stack([
+                np.sum((descriptors - center) ** 2, axis=1)
+                for center in centers
+            ], axis=1)
+            new_labels = np.argmin(distances, axis=1).astype(np.int32)
+            if np.array_equal(new_labels, labels) and np.all(
+                np.bincount(new_labels, minlength=2) > 0
+            ):
+                break
+            labels = new_labels
+            for mode in range(2):
+                selected = descriptors[labels == mode]
+                if selected.size:
+                    centers[mode] = np.mean(selected, axis=0)
+
+        total = float(np.sum((descriptors - mean) ** 2))
+        within = float(np.sum([
+            np.sum((descriptors[labels == mode] - centers[mode]) ** 2)
+            for mode in range(2)
+        ]))
+        separation = 0.0 if total <= self.eps else max(0.0, 1.0 - within / total)
+        return labels, centers, separation
+
     def _center_features(self, features: np.ndarray) -> np.ndarray:
         if self.position_mean_ is None:
             return features
@@ -500,7 +673,18 @@ class SubspaceAD:
                 "patch feature shape mismatch for spatial centering: "
                 f"got {features.shape}, expected {self.position_mean_.shape}"
             )
-        return features - self.position_mean_
+        position_mean = self.position_mean_
+        if (
+            self.mixture_position_means_ is not None
+            and self.mixture_descriptor_centers_ is not None
+        ):
+            descriptor = self._mixture_descriptor(features)
+            distances = np.sum(
+                (self.mixture_descriptor_centers_ - descriptor) ** 2,
+                axis=1,
+            )
+            position_mean = self.mixture_position_means_[int(np.argmin(distances))]
+        return features - position_mean
 
     @classmethod
     def load_images_from_directory(
@@ -1239,6 +1423,11 @@ class SubspaceAD:
             "branch_fusion": self.branch_fusion,
             "branches": [model.state_dict() for model in self.branch_models_],
             "spatial_centering": self.spatial_centering,
+            "mixture_components": self.mixture_components,
+            "mixture_descriptor_grid": self.mixture_descriptor_grid,
+            "mixture_min_separation": self.mixture_min_separation,
+            "mixture_min_fraction": self.mixture_min_fraction,
+            "mixture_min_images": self.mixture_min_images,
             "score_transform": self.score_transform,
             "multiband_pca_ev": self.multiband_pca_ev,
             "multiband_score_weight": self.multiband_score_weight,
@@ -1271,6 +1460,10 @@ class SubspaceAD:
             "n_components": self.n_components_,
             "feature_dim": self.feature_dim_,
             "position_mean": self.position_mean_,
+            "mixture_position_means": self.mixture_position_means_,
+            "mixture_descriptor_centers": self.mixture_descriptor_centers_,
+            "mixture_separation": self.mixture_separation_,
+            "mixture_cluster_sizes": self.mixture_cluster_sizes_,
             "patch_grid": self.patch_grid_,
             "score_reference": self.score_reference_,
             "multiband_components": self.multiband_components_,
@@ -1303,7 +1496,7 @@ class SubspaceAD:
         state = self.state_dict()
         is_multi_branch = bool(state["branches"])
         metadata = {
-            "format_version": 6,
+            "format_version": 7,
             "model_name": str(state["model_name"]),
             "pca_ev": (
                 None if state["pca_ev"] is None else float(state["pca_ev"])
@@ -1314,6 +1507,17 @@ class SubspaceAD:
             "feature_l2_normalize": bool(state["feature_l2_normalize"]),
             "branch_fusion": str(state["branch_fusion"]),
             "spatial_centering": float(state["spatial_centering"]),
+            "mixture_components": int(state["mixture_components"]),
+            "mixture_descriptor_grid": int(state["mixture_descriptor_grid"]),
+            "mixture_min_separation": float(state["mixture_min_separation"]),
+            "mixture_min_fraction": float(state["mixture_min_fraction"]),
+            "mixture_min_images": int(state["mixture_min_images"]),
+            "mixture_separation": float(state["mixture_separation"]),
+            "mixture_cluster_sizes": (
+                None
+                if state["mixture_cluster_sizes"] is None
+                else [int(value) for value in state["mixture_cluster_sizes"]]
+            ),
             "score_transform": str(state["score_transform"]),
             "multiband_pca_ev": (
                 None
@@ -1404,16 +1608,41 @@ class SubspaceAD:
         if is_multi_branch:
             branch_metadata = []
             for index, branch in enumerate(state["branches"]):
-                branch_metadata.append({
+                current_metadata = {
                     key: value
                     for key, value in branch.items()
-                    if key not in {"mean", "components", "eigvals", "position_mean", "branches"}
-                })
+                    if key not in {
+                        "mean",
+                        "components",
+                        "eigvals",
+                        "position_mean",
+                        "mixture_position_means",
+                        "mixture_descriptor_centers",
+                        "mixture_cluster_sizes",
+                        "branches",
+                    }
+                }
+                current_metadata["mixture_cluster_sizes"] = (
+                    None
+                    if branch["mixture_cluster_sizes"] is None
+                    else [
+                        int(value) for value in branch["mixture_cluster_sizes"]
+                    ]
+                )
+                branch_metadata.append(current_metadata)
                 arrays[f"branch_{index}_mean"] = branch["mean"]
                 arrays[f"branch_{index}_components"] = branch["components"]
                 arrays[f"branch_{index}_eigvals"] = branch["eigvals"]
                 if branch["position_mean"] is not None:
                     arrays[f"branch_{index}_position_mean"] = branch["position_mean"]
+                if branch["mixture_position_means"] is not None:
+                    arrays[f"branch_{index}_mixture_position_means"] = branch[
+                        "mixture_position_means"
+                    ]
+                if branch["mixture_descriptor_centers"] is not None:
+                    arrays[f"branch_{index}_mixture_descriptor_centers"] = branch[
+                        "mixture_descriptor_centers"
+                    ]
             metadata["branch_metadata"] = branch_metadata
             arrays["metadata"] = np.asarray(json.dumps(metadata))
         else:
@@ -1437,6 +1666,12 @@ class SubspaceAD:
             })
             if state["position_mean"] is not None:
                 arrays["position_mean"] = state["position_mean"]
+            if state["mixture_position_means"] is not None:
+                arrays["mixture_position_means"] = state["mixture_position_means"]
+            if state["mixture_descriptor_centers"] is not None:
+                arrays["mixture_descriptor_centers"] = state[
+                    "mixture_descriptor_centers"
+                ]
         np.savez_compressed(npz_path, **arrays)
 
     def load_npz(self, npz_path: str | Path) -> "SubspaceAD":
@@ -1466,7 +1701,7 @@ class SubspaceAD:
                 raise ValueError("Invalid SubspaceAD NPZ metadata.")
 
             format_version = metadata.get("format_version")
-            if format_version not in {1, 2, 3, 4, 5, 6}:
+            if format_version not in {1, 2, 3, 4, 5, 6, 7}:
                 raise ValueError(
                     "Unsupported SubspaceAD NPZ format version: "
                     f"{metadata.get('format_version')!r}"
@@ -1498,6 +1733,16 @@ class SubspaceAD:
                     position_key = prefix + "position_mean"
                     if position_key in saved.files:
                         branch["position_mean"] = np.array(saved[position_key], copy=True)
+                    mixture_means_key = prefix + "mixture_position_means"
+                    if mixture_means_key in saved.files:
+                        branch["mixture_position_means"] = np.array(
+                            saved[mixture_means_key], copy=True
+                        )
+                    mixture_centers_key = prefix + "mixture_descriptor_centers"
+                    if mixture_centers_key in saved.files:
+                        branch["mixture_descriptor_centers"] = np.array(
+                            saved[mixture_centers_key], copy=True
+                        )
                     branches.append(branch)
                 state = {**metadata, "branches": branches}
             else:
@@ -1515,6 +1760,14 @@ class SubspaceAD:
                 if "position_mean" in saved.files:
                     state["position_mean"] = np.array(
                         saved["position_mean"], copy=True
+                    )
+                if "mixture_position_means" in saved.files:
+                    state["mixture_position_means"] = np.array(
+                        saved["mixture_position_means"], copy=True
+                    )
+                if "mixture_descriptor_centers" in saved.files:
+                    state["mixture_descriptor_centers"] = np.array(
+                        saved["mixture_descriptor_centers"], copy=True
                     )
 
             # Versions 1-4 predate spectral-band and tail scoring. Loading one
@@ -1542,6 +1795,22 @@ class SubspaceAD:
                     "spatial_score_correlation": 0.0,
                     "patch_grid": None,
                 })
+            if format_version < 7:
+                state.update({
+                    "mixture_components": 1,
+                    "mixture_position_means": None,
+                    "mixture_descriptor_centers": None,
+                    "mixture_separation": 0.0,
+                    "mixture_cluster_sizes": None,
+                })
+                for branch in state.get("branches", []):
+                    branch.update({
+                        "mixture_components": 1,
+                        "mixture_position_means": None,
+                        "mixture_descriptor_centers": None,
+                        "mixture_separation": 0.0,
+                        "mixture_cluster_sizes": None,
+                    })
 
         self.load_state_dict(state)
         return self
@@ -1617,6 +1886,17 @@ class SubspaceAD:
         self.feature_l2_normalize = state["feature_l2_normalize"]
         self.branch_fusion = str(state.get("branch_fusion", "mean"))
         self.spatial_centering = float(state.get("spatial_centering", 0.0))
+        self.mixture_components = int(state.get("mixture_components", 1))
+        self.mixture_descriptor_grid = int(
+            state.get("mixture_descriptor_grid", 4)
+        )
+        self.mixture_min_separation = float(
+            state.get("mixture_min_separation", 0.08)
+        )
+        self.mixture_min_fraction = float(
+            state.get("mixture_min_fraction", 0.15)
+        )
+        self.mixture_min_images = int(state.get("mixture_min_images", 8))
         self.score_transform = str(state.get("score_transform", "squared"))
         self.multiband_pca_ev = state.get("multiband_pca_ev")
         if self.multiband_pca_ev is not None:
@@ -1684,6 +1964,25 @@ class SubspaceAD:
         self.n_components_ = state.get("n_components")
         self.feature_dim_ = state.get("feature_dim")
         self.position_mean_ = state.get("position_mean")
+        mixture_position_means = state.get("mixture_position_means")
+        self.mixture_position_means_ = (
+            None
+            if mixture_position_means is None
+            else np.asarray(mixture_position_means, dtype=np.float32)
+        )
+        mixture_descriptor_centers = state.get("mixture_descriptor_centers")
+        self.mixture_descriptor_centers_ = (
+            None
+            if mixture_descriptor_centers is None
+            else np.asarray(mixture_descriptor_centers, dtype=np.float32)
+        )
+        self.mixture_separation_ = float(state.get("mixture_separation", 0.0))
+        mixture_cluster_sizes = state.get("mixture_cluster_sizes")
+        self.mixture_cluster_sizes_ = (
+            None
+            if mixture_cluster_sizes is None
+            else np.asarray(mixture_cluster_sizes, dtype=np.int32)
+        )
         patch_grid = state.get("patch_grid")
         self.patch_grid_ = (
             None

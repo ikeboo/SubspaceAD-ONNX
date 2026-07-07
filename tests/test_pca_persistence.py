@@ -37,6 +37,14 @@ class PcaPersistenceTests(unittest.TestCase):
         )
         model._fit_pca(features)
         model.position_mean_ = np.arange(6, dtype=np.float32).reshape(2, 3)
+        model.mixture_position_means_ = np.arange(
+            12, dtype=np.float32
+        ).reshape(2, 2, 3)
+        model.mixture_descriptor_centers_ = np.arange(
+            96, dtype=np.float32
+        ).reshape(2, 48)
+        model.mixture_separation_ = 0.25
+        model.mixture_cluster_sizes_ = np.array([10, 12], dtype=np.int32)
         model.patch_grid_ = (1, 2)
         model.score_reference_ = 0.125
         model.multiband_score_reference_ = 0.25
@@ -92,6 +100,20 @@ class PcaPersistenceTests(unittest.TestCase):
         self.assertEqual(restored.tail_score_gain, original.tail_score_gain)
         np.testing.assert_array_equal(
             restored.position_mean_, original.position_mean_
+        )
+        np.testing.assert_array_equal(
+            restored.mixture_position_means_,
+            original.mixture_position_means_,
+        )
+        np.testing.assert_array_equal(
+            restored.mixture_descriptor_centers_,
+            original.mixture_descriptor_centers_,
+        )
+        self.assertEqual(
+            restored.mixture_separation_, original.mixture_separation_
+        )
+        np.testing.assert_array_equal(
+            restored.mixture_cluster_sizes_, original.mixture_cluster_sizes_
         )
         self.assertEqual(restored.patch_grid_, original.patch_grid_)
         self.assertEqual(restored.normalize_map, original.normalize_map)

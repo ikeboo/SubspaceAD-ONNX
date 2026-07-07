@@ -212,6 +212,61 @@ class ScoringTests(unittest.TestCase):
             expected,
         )
 
+    def test_shared_ppca_mixture_selects_position_mean_per_image(self) -> None:
+        model = SubspaceAD(
+            "model.onnx",
+            dino=object(),
+            pca_dim=1,
+            mixture_components=2,
+            mixture_descriptor_grid=1,
+            mixture_min_separation=0.0,
+            mixture_min_fraction=0.1,
+            mixture_min_images=1,
+        )
+        model.patch_grid_ = (2, 2)
+        low = np.tile(np.array([1.0, 0.0], dtype=np.float32), (4, 1))
+        high = np.tile(np.array([0.0, 1.0], dtype=np.float32), (4, 1))
+        extracted = [
+            (low + index * 0.001, (2, 2), (8, 8))
+            for index in range(4)
+        ] + [
+            (high + index * 0.001, (2, 2), (8, 8))
+            for index in range(4)
+        ]
+
+        model._fit_position_center(extracted)
+
+        self.assertIsNotNone(model.mixture_position_means_)
+        self.assertIsNotNone(model.mixture_descriptor_centers_)
+        self.assertEqual(model.mixture_position_means_.shape, (2, 4, 2))
+        self.assertGreater(model.mixture_separation_, 0.9)
+        np.testing.assert_allclose(
+            model._center_features(low + 0.001),
+            np.full_like(low, -0.0005),
+            atol=1e-6,
+        )
+
+    def test_shared_ppca_mixture_gate_rejects_weak_split(self) -> None:
+        model = SubspaceAD(
+            "model.onnx",
+            dino=object(),
+            pca_dim=1,
+            mixture_components=2,
+            mixture_min_separation=1.0,
+        )
+        model.patch_grid_ = (2, 2)
+        rng = np.random.default_rng(9)
+        extracted = [
+            (rng.normal(size=(4, 3)).astype(np.float32), (2, 2), (8, 8))
+            for _ in range(12)
+        ]
+
+        model._fit_position_center(extracted)
+
+        self.assertIsNone(model.mixture_position_means_)
+        self.assertIsNone(model.mixture_descriptor_centers_)
+        self.assertIsNotNone(model.mixture_cluster_sizes_)
+
 
 if __name__ == "__main__":
     unittest.main()
