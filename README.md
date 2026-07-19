@@ -96,8 +96,10 @@ restored_model.load_npz("models/pca_params.npz")
 
 # Run inference
 target_image = read_bgr("data/test/sample.png")
-anomaly_map = model(target_image)
-image_score = float(anomaly_map.max())
+anomaly_map, image_score = model(target_image)
+
+# A string path is also loaded internally with cv2.imread
+# anomaly_map, image_score = model("data/test/sample.png")
 
 print(f"image score: {image_score:.4f}")
 print(f"pixel threshold: {model.threshold_:.4f}")

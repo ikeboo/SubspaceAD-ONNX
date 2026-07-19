@@ -24,7 +24,7 @@ class SubspaceAD:
     Expected usage:
         model = SubspaceAD("dinov3_vitsplus")
         model.fit(normal_imgs)
-        anomaly_map = model(target_img)
+        anomaly_map, image_score = model(target_img)
 
     Assumed DINOv3 interface:
         cls_token, patch_tokens = dinov3(img: np.ndarray)
@@ -60,6 +60,9 @@ class SubspaceAD:
         feature_l2_normalize: bool = False,
         branch_fusion: str = "mean",
         spatial_centering: float = 1.0,
+        positional_debias_components: Optional[int] = 2,
+        positional_debias_mode: str = "auto",
+        positional_debias_alpha: float = 1.0,
         mixture_components: int = 2,
         mixture_descriptor_grid: int = 4,
         mixture_min_separation: float = 0.08,
@@ -115,6 +118,14 @@ class SubspaceAD:
                 各patch位置の正常特徴平均をPCA前に差し引く強さ。0.0は従来の
                 global PCA、1.0は完全な位置中心化です。特徴そのものは保持せず、
                 位置ごとの平均だけを保存します。
+            positional_debias_components:
+                INSID3のpositional debiasに相当する、ゼロ画像特徴から推定した
+                位置成分の除去数。Noneまたは0で無効化します。
+            positional_debias_mode:
+                "auto"なら正常score統計だけで位置局所tailが有効なカテゴリに
+                限ってdebiasを使います。"on"は常時有効、"off"は無効です。
+            positional_debias_alpha:
+                位置成分を差し引く強さ。1.0で直交補空間への完全射影です。
             mixture_components:
                 正常画像の空間的な外観を最大いくつのモードで表すか。2の場合、
                 低解像度化したpatch特徴を2-meansで分け、十分に分離したときだけ
@@ -198,6 +209,19 @@ class SubspaceAD:
             raise ValueError("calibration_targetは0より大きい値にしてください。")
         if not 0.0 <= spatial_centering <= 1.0:
             raise ValueError("spatial_centeringは0.0から1.0の範囲にしてください。")
+        if (
+            positional_debias_components is not None
+            and positional_debias_components < 0
+        ):
+            raise ValueError(
+                "positional_debias_componentsは0以上、またはNoneにしてください。"
+            )
+        if positional_debias_mode not in {"auto", "on", "off"}:
+            raise ValueError(
+                "positional_debias_modeは'auto'、'on'、'off'のいずれかにしてください。"
+            )
+        if not 0.0 <= positional_debias_alpha <= 1.0:
+            raise ValueError("positional_debias_alphaは0.0から1.0の範囲にしてください。")
         if mixture_components not in {1, 2}:
             raise ValueError("mixture_componentsは1または2にしてください。")
         if mixture_descriptor_grid < 1:
@@ -272,6 +296,13 @@ class SubspaceAD:
         self.feature_l2_normalize = feature_l2_normalize
         self.branch_fusion = branch_fusion
         self.spatial_centering = float(spatial_centering)
+        self.positional_debias_components = (
+            None
+            if positional_debias_components is None
+            else int(positional_debias_components)
+        )
+        self.positional_debias_mode = str(positional_debias_mode)
+        self.positional_debias_alpha = float(positional_debias_alpha)
         self.mixture_components = int(mixture_components)
         self.mixture_descriptor_grid = int(mixture_descriptor_grid)
         self.mixture_min_separation = float(mixture_min_separation)
@@ -323,6 +354,8 @@ class SubspaceAD:
         self.n_components_: Optional[int] = None
         self.feature_dim_: Optional[int] = None
         self.position_mean_: Optional[np.ndarray] = None
+        self.positional_debias_bases_: Optional[np.ndarray] = None
+        self.positional_debias_enabled_: bool = False
         self.mixture_position_means_: Optional[np.ndarray] = None
         self.mixture_descriptor_centers_: Optional[np.ndarray] = None
         self.mixture_separation_: float = 0.0
@@ -369,15 +402,60 @@ class SubspaceAD:
         extracted = []
 
         for img in tqdm(imgs, desc="Extracting features",unit="images"):
-            feat, grid_size = self._extract_patch_features(img)
+            feat, grid_size = self._extract_patch_features(
+                img,
+                apply_positional_debias=False,
+            )
             extracted.append((feat, grid_size, img.shape[:2]))
 
+        if self._positional_debias_requested() and self.positional_debias_mode == "on":
+            self._fit_positional_debias_bases(imgs[0].shape[:2])
+            self.positional_debias_enabled_ = self.positional_debias_bases_ is not None
+            return self._fit_from_extracted(
+                self._apply_positional_debias_to_extracted(extracted)
+            )
+
+        self.positional_debias_bases_ = None
+        self.positional_debias_enabled_ = False
+        auto_probe = (
+            self._positional_debias_requested()
+            and self.positional_debias_mode == "auto"
+        )
+        self._fit_from_extracted(extracted, fit_score_scale=not auto_probe)
+        if (
+            auto_probe
+            and self._should_enable_positional_debias()
+        ):
+            self._fit_positional_debias_bases(imgs[0].shape[:2])
+            self.positional_debias_enabled_ = self.positional_debias_bases_ is not None
+            if self.positional_debias_enabled_:
+                print(
+                    "INSID3 positional debias enabled: "
+                    f"components={self.positional_debias_bases_.shape[-1]}, "
+                    f"alpha={self.positional_debias_alpha:.6g}"
+                )
+                self._fit_from_extracted(
+                    self._apply_positional_debias_to_extracted(extracted)
+                )
+        elif auto_probe:
+            _, calibration_extracted = self._split_fit_calibration(extracted)
+            self._fit_score_scale(extracted, calibration_extracted)
+            print("INSID3 positional debias disabled by normal-score gate.")
+        return self
+
+    def _fit_from_extracted(
+        self,
+        extracted: list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
+        *,
+        fit_score_scale: bool = True,
+    ) -> "SubspaceAD":
         self.patch_grid_ = tuple(extracted[0][1])
         fit_extracted, calibration_extracted = self._split_fit_calibration(extracted)
         if extracted[0][0].ndim == 3:
             self._fit_branches(fit_extracted)
             self._fit_branch_local_tail(extracted)
-            self._fit_score_scale(extracted, calibration_extracted)
+            if fit_score_scale:
+                self._fit_score_scale(extracted, calibration_extracted)
             return self
 
         self._fit_position_center(fit_extracted)
@@ -393,8 +471,91 @@ class SubspaceAD:
         print(f"Fitting PCA on {X.shape[0]} patch tokens with feature dim {X.shape[1]}.")
         self._fit_pca(X)
         self._fit_score_reference(X)
-        self._fit_score_scale(extracted, calibration_extracted)
+        if fit_score_scale:
+            self._fit_score_scale(extracted, calibration_extracted)
         return self
+
+    def _positional_debias_requested(self) -> bool:
+        return (
+            self.positional_debias_mode != "off"
+            and self.positional_debias_components is not None
+            and self.positional_debias_components > 0
+            and self.positional_debias_alpha > 0.0
+        )
+
+    def _should_enable_positional_debias(self) -> bool:
+        """Use INSID3-style debias only for normal layouts with position-local tails."""
+        return bool(self.position_local_tail_enabled_)
+
+    def _fit_positional_debias_bases(
+        self,
+        image_shape: tuple[int, int],
+    ) -> None:
+        """Estimate INSID3's positional subspace from a zero image."""
+        if not self._positional_debias_requested():
+            self.positional_debias_bases_ = None
+            return
+
+        zero_image = np.zeros((*image_shape, 3), dtype=np.uint8)
+        features, _ = self._extract_patch_features(
+            zero_image,
+            apply_positional_debias=False,
+        )
+        branches = features if features.ndim == 3 else features[None]
+        bases = []
+        for branch_features in branches:
+            centered = branch_features.astype(np.float64).T
+            centered = centered - np.mean(centered, axis=1, keepdims=True)
+            u, _, _ = np.linalg.svd(centered, full_matrices=False)
+            k = min(int(self.positional_debias_components or 0), u.shape[1])
+            if k <= 0:
+                self.positional_debias_bases_ = None
+                return
+            bases.append(u[:, :k].astype(np.float32))
+        self.positional_debias_bases_ = np.stack(bases, axis=0)
+
+    def _apply_positional_debias_to_extracted(
+        self,
+        extracted: list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]],
+    ) -> list[tuple[np.ndarray, tuple[int, int], tuple[int, int]]]:
+        return [
+            (
+                self._apply_positional_debias(features),
+                grid_size,
+                output_size,
+            )
+            for features, grid_size, output_size in extracted
+        ]
+
+    def _apply_positional_debias(self, features: np.ndarray) -> np.ndarray:
+        bases = self.positional_debias_bases_
+        if (
+            not self.positional_debias_enabled_
+            or bases is None
+            or bases.size == 0
+        ):
+            return features
+
+        branches = features if features.ndim == 3 else features[None]
+        if bases.shape[0] != branches.shape[0]:
+            raise ValueError(
+                "positional debias branch count mismatch: "
+                f"features={branches.shape[0]}, bases={bases.shape[0]}"
+            )
+
+        alpha = self.positional_debias_alpha
+        transformed = []
+        for branch_features, basis in zip(branches, bases):
+            x = branch_features.astype(np.float32, copy=False)
+            b = basis.astype(np.float32, copy=False)
+            x = x - alpha * ((x @ b) @ b.T)
+            norms = np.linalg.norm(x, axis=1, keepdims=True)
+            x = x / np.maximum(norms, self.eps)
+            transformed.append(x.astype(np.float32))
+
+        if features.ndim == 3:
+            return np.stack(transformed, axis=0)
+        return transformed[0]
 
     def _fit_branches(
         self,
@@ -440,6 +601,9 @@ class SubspaceAD:
             max_fit_tokens=self.max_fit_tokens,
             feature_l2_normalize=self.feature_l2_normalize,
             spatial_centering=self.spatial_centering,
+            positional_debias_components=None,
+            positional_debias_mode="off",
+            positional_debias_alpha=self.positional_debias_alpha,
             mixture_components=self.mixture_components,
             mixture_descriptor_grid=self.mixture_descriptor_grid,
             mixture_min_separation=self.mixture_min_separation,
@@ -729,18 +893,23 @@ class SubspaceAD:
 
     def __call__(
         self,
-        target_img: np.ndarray,
+        target_img: np.ndarray | str | Path,
         *,
+        score_method: str = "max",
         output_size: Optional[Tuple[int, int]] = None,
         normalize_map: Optional[bool] = None,
         return_patch_map: bool = False,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, float]:
         """
-        推論して異常度マップを返す。
+        1回の推論で異常度マップと画像単位の異常スコアを返す。
 
         Args:
             target_img:
-                推論対象画像。
+                推論対象のOpenCV BGR画像、または画像ファイルのパス。
+                パスの場合はcv2.imreadでBGR画像として読み込む。
+            score_method:
+                画像スコアの集約方法。既定値は"max"。
+                "mean", "p99", "mtop5", "mtop1p"も指定可能。
             output_size:
                 出力サイズ。Noneなら target_img.shape[:2] に合わせる。
                 指定形式は (height, width)。
@@ -752,11 +921,20 @@ class SubspaceAD:
                 Falseなら画像サイズへresizeしたマップを返す。
 
         Returns:
-            anomaly_map:
-                shape = [H, W] の np.float32。
+            (anomaly_map, image_score):
+                anomaly_mapはshape = [H, W] のnp.float32。
+                image_scoreはanomaly_mapをscore_methodで集約したfloat。
         """
-        self._check_fitted()
+        if isinstance(target_img, (str, Path)):
+            image_path = Path(target_img)
+            if not image_path.exists():
+                raise FileNotFoundError(f"image_path not found: {image_path}")
+            loaded_img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if loaded_img is None:
+                raise ValueError(f"Unable to read image: {image_path}")
+            target_img = loaded_img
 
+        self._check_fitted()
         feat, grid_size = self._extract_patch_features(target_img)
         scores = self._score_features(feat)
 
@@ -775,7 +953,9 @@ class SubspaceAD:
         if do_norm:
             out = self._minmax_norm(out)
 
-        return out.astype(np.float32)
+        anomaly_map = out.astype(np.float32)
+        image_score = self._aggregate_image_score(anomaly_map, score_method)
+        return anomaly_map, image_score
 
     def _fit_score_scale(
         self,
@@ -908,32 +1088,37 @@ class SubspaceAD:
                 - "mtop5": 最高異常値上位5個の平均を用いる。
                 - "mtop1p": 最高異常値上位1%の平均を用いる。
         """
-        anomaly_map = self(target_img, normalize_map=False)
+        _, score = self(
+            target_img,
+            score_method=method,
+            normalize_map=False,
+        )
+        return score
 
+    @staticmethod
+    def _aggregate_image_score(anomaly_map: np.ndarray, method: str) -> float:
+        """異常マップを画像単位のスコアへ集約する。"""
         if method == "max":
             return float(np.max(anomaly_map))
-
         if method == "mean":
             return float(np.mean(anomaly_map))
-
         if method == "p99":
             return float(np.percentile(anomaly_map, 99))
 
+        flat = anomaly_map.ravel()
         if method == "mtop5":
-            flat = anomaly_map.ravel()
             k = min(5, flat.size)
             return float(np.mean(np.partition(flat, -k)[-k:]))
-
         if method == "mtop1p":
-            flat = anomaly_map.ravel()
             k = max(1, int(flat.size * 0.01))
             return float(np.mean(np.partition(flat, -k)[-k:]))
-
-        raise ValueError(f"Unknown image score method: {method}")
+        raise ValueError(f"Unknown score_method: {method}")
 
     def _extract_patch_features(
         self,
         img: np.ndarray,
+        *,
+        apply_positional_debias: bool = True,
     ) -> tuple[np.ndarray, tuple[int, int]]:
         """
         DINOv3からpatch tokenを取り出し、[N, C]に変換する。
@@ -963,8 +1148,14 @@ class SubspaceAD:
             features.append(feat)
 
         if len(features) == 1:
-            return features[0], grid_size
-        return np.stack(features, axis=0), grid_size
+            feature_output = features[0]
+        else:
+            feature_output = np.stack(features, axis=0)
+
+        if apply_positional_debias:
+            feature_output = self._apply_positional_debias(feature_output)
+
+        return feature_output, grid_size
 
     def _patch_tokens_to_grid(
         self,
@@ -1423,6 +1614,11 @@ class SubspaceAD:
             "branch_fusion": self.branch_fusion,
             "branches": [model.state_dict() for model in self.branch_models_],
             "spatial_centering": self.spatial_centering,
+            "positional_debias_components": self.positional_debias_components,
+            "positional_debias_mode": self.positional_debias_mode,
+            "positional_debias_alpha": self.positional_debias_alpha,
+            "positional_debias_enabled": self.positional_debias_enabled_,
+            "positional_debias_bases": self.positional_debias_bases_,
             "mixture_components": self.mixture_components,
             "mixture_descriptor_grid": self.mixture_descriptor_grid,
             "mixture_min_separation": self.mixture_min_separation,
@@ -1496,7 +1692,7 @@ class SubspaceAD:
         state = self.state_dict()
         is_multi_branch = bool(state["branches"])
         metadata = {
-            "format_version": 7,
+            "format_version": 8,
             "model_name": str(state["model_name"]),
             "pca_ev": (
                 None if state["pca_ev"] is None else float(state["pca_ev"])
@@ -1507,6 +1703,16 @@ class SubspaceAD:
             "feature_l2_normalize": bool(state["feature_l2_normalize"]),
             "branch_fusion": str(state["branch_fusion"]),
             "spatial_centering": float(state["spatial_centering"]),
+            "positional_debias_components": (
+                None
+                if state["positional_debias_components"] is None
+                else int(state["positional_debias_components"])
+            ),
+            "positional_debias_mode": str(state["positional_debias_mode"]),
+            "positional_debias_alpha": float(state["positional_debias_alpha"]),
+            "positional_debias_enabled": bool(
+                state["positional_debias_enabled"]
+            ),
             "mixture_components": int(state["mixture_components"]),
             "mixture_descriptor_grid": int(state["mixture_descriptor_grid"]),
             "mixture_min_separation": float(state["mixture_min_separation"]),
@@ -1605,6 +1811,8 @@ class SubspaceAD:
             "calibration_count": int(state["calibration_count"]),
         }
         arrays = {"metadata": np.asarray(json.dumps(metadata))}
+        if state["positional_debias_bases"] is not None:
+            arrays["positional_debias_bases"] = state["positional_debias_bases"]
         if is_multi_branch:
             branch_metadata = []
             for index, branch in enumerate(state["branches"]):
@@ -1616,6 +1824,7 @@ class SubspaceAD:
                         "components",
                         "eigvals",
                         "position_mean",
+                        "positional_debias_bases",
                         "mixture_position_means",
                         "mixture_descriptor_centers",
                         "mixture_cluster_sizes",
@@ -1701,7 +1910,7 @@ class SubspaceAD:
                 raise ValueError("Invalid SubspaceAD NPZ metadata.")
 
             format_version = metadata.get("format_version")
-            if format_version not in {1, 2, 3, 4, 5, 6, 7}:
+            if format_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
                 raise ValueError(
                     "Unsupported SubspaceAD NPZ format version: "
                     f"{metadata.get('format_version')!r}"
@@ -1745,6 +1954,11 @@ class SubspaceAD:
                         )
                     branches.append(branch)
                 state = {**metadata, "branches": branches}
+                if "positional_debias_bases" in saved.files:
+                    state["positional_debias_bases"] = np.array(
+                        saved["positional_debias_bases"],
+                        copy=True,
+                    )
             else:
                 required_keys = {"mean", "components", "eigvals"}
                 missing_keys = required_keys.difference(saved.files)
@@ -1768,6 +1982,11 @@ class SubspaceAD:
                 if "mixture_descriptor_centers" in saved.files:
                     state["mixture_descriptor_centers"] = np.array(
                         saved["mixture_descriptor_centers"], copy=True
+                    )
+                if "positional_debias_bases" in saved.files:
+                    state["positional_debias_bases"] = np.array(
+                        saved["positional_debias_bases"],
+                        copy=True,
                     )
 
             # Versions 1-4 predate spectral-band and tail scoring. Loading one
@@ -1811,6 +2030,14 @@ class SubspaceAD:
                         "mixture_separation": 0.0,
                         "mixture_cluster_sizes": None,
                     })
+            if format_version < 8:
+                state.update({
+                    "positional_debias_components": None,
+                    "positional_debias_mode": "off",
+                    "positional_debias_alpha": 1.0,
+                    "positional_debias_enabled": False,
+                    "positional_debias_bases": None,
+                })
 
         self.load_state_dict(state)
         return self
@@ -1833,19 +2060,12 @@ class SubspaceAD:
         Returns:
             anomaly_map: Floating point anomaly map of shape [H, W].
         """
-        image_path = Path(image_path)
-        if not image_path.exists():
-            raise FileNotFoundError(f"image_path not found: {image_path}")
-
-        img = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if img is None:
-            raise ValueError(f"Unable to read image: {image_path}")
-
-        return self(
-            img,
+        anomaly_map, _ = self(
+            image_path,
             output_size=output_size,
             normalize_map=normalize_map,
         )
+        return anomaly_map
 
     def predict_mask(
         self,
@@ -1886,6 +2106,27 @@ class SubspaceAD:
         self.feature_l2_normalize = state["feature_l2_normalize"]
         self.branch_fusion = str(state.get("branch_fusion", "mean"))
         self.spatial_centering = float(state.get("spatial_centering", 0.0))
+        positional_debias_components = state.get("positional_debias_components")
+        self.positional_debias_components = (
+            None
+            if positional_debias_components is None
+            else int(positional_debias_components)
+        )
+        self.positional_debias_mode = str(
+            state.get("positional_debias_mode", "off")
+        )
+        self.positional_debias_alpha = float(
+            state.get("positional_debias_alpha", 1.0)
+        )
+        positional_debias_bases = state.get("positional_debias_bases")
+        self.positional_debias_bases_ = (
+            None
+            if positional_debias_bases is None
+            else np.asarray(positional_debias_bases, dtype=np.float32)
+        )
+        self.positional_debias_enabled_ = bool(
+            state.get("positional_debias_enabled", False)
+        ) and self.positional_debias_bases_ is not None
         self.mixture_components = int(state.get("mixture_components", 1))
         self.mixture_descriptor_grid = int(
             state.get("mixture_descriptor_grid", 4)

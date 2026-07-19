@@ -112,8 +112,10 @@ class MVTecEvaluator:
                 unit="images",
                 dynamic_ncols=True,
             ):
-                anomaly_map = self._predict_map(model, item["image_path"])
-                image_score = self._aggregate_image_score(anomaly_map)
+                anomaly_map, image_score = self._predict(
+                    model,
+                    item["image_path"],
+                )
                 gt_mask = self._load_gt_mask(
                     item["image_path"],
                     item["category"],
@@ -316,7 +318,11 @@ class MVTecEvaluator:
         # SubspaceAD/DINOv3へOpenCV BGRのまま渡す。
         return image
 
-    def _predict_map(self, model: object, image_path: Path) -> np.ndarray:
+    def _predict(
+        self,
+        model: object,
+        image_path: Path,
+    ) -> tuple[np.ndarray, float]:
         if self.use_mask_output:
             if not hasattr(model, "predict_mask"):
                 raise AttributeError(
@@ -327,12 +333,13 @@ class MVTecEvaluator:
                 str(image_path),
                 threshold=self.mask_threshold,
             )
+            image_score = None
         else:
-            if not hasattr(model, "predict_anomaly_map"):
-                raise AttributeError(
-                    "model must implement predict_anomaly_map(image_path: str) -> np.ndarray"
-                )
-            anomaly_map = model.predict_anomaly_map(str(image_path))
+            image = self._load_bgr_image(image_path)
+            anomaly_map, image_score = model(
+                image,
+                score_method=self.image_score_method,
+            )
 
         anomaly_map = np.asarray(anomaly_map)
         if anomaly_map.ndim != 2:
@@ -348,7 +355,12 @@ class MVTecEvaluator:
         anomaly_map = anomaly_map.astype(np.float32)
         if not np.all(np.isfinite(anomaly_map)):
             raise ValueError(f"Anomaly map contains NaN or infinity: {image_path}")
-        return anomaly_map
+        if image_score is None:
+            image_score = self._aggregate_image_score(anomaly_map)
+        image_score = float(image_score)
+        if not np.isfinite(image_score):
+            raise ValueError(f"Image score is NaN or infinity: {image_path}")
+        return anomaly_map, image_score
 
     def _aggregate_image_score(self, anomaly_map: np.ndarray) -> float:
         flat = anomaly_map.ravel().astype(np.float64)

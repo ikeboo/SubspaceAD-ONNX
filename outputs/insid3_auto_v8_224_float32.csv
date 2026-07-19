@@ -1,0 +1,13 @@
+date,datasets,img_auroc,img_aupr,seg_auroc,seg_pro,description
+2026-07-08 00:49:42,bottle,1.00000,1.00000,0.98814,0.94913,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,capsule,0.95612,0.98984,0.98879,0.95472,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,carpet,0.99960,0.99988,0.99400,0.97065,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,grid,0.99916,0.99970,0.98881,0.96682,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,hazelnut,0.99964,0.99980,0.99143,0.96212,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,leather,1.00000,1.00000,0.99439,0.98355,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,screw,0.80406,0.92430,0.97971,0.91668,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,tile,1.00000,1.00000,0.97859,0.93385,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,toothbrush,0.92778,0.96595,0.99152,0.92947,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,transistor,0.97583,0.96500,0.96278,0.81572,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,wood,0.98947,0.99675,0.96535,0.93518,insid3_auto_v8_224_float32
+2026-07-08 00:49:42,average,0.96833,0.98557,0.98396,0.93799,insid3_auto_v8_224_float32;bottle;capsule;carpet;grid;hazelnut;leather;screw;tile;toothbrush;transistor;wood

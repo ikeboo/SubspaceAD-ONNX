@@ -216,14 +216,26 @@ class MVTecMetricTests(unittest.TestCase):
 class FakeModel:
     def __init__(self) -> None:
         self.fit_images: list[np.ndarray] | None = None
+        self.score_methods: list[str] = []
 
     def fit(self, images: list[np.ndarray]) -> None:
         self.fit_images = images
 
-    def predict_anomaly_map(self, image_path: str) -> np.ndarray:
-        if Path(image_path).parent.name == "good":
-            return np.zeros((2, 2), dtype=np.float32)
-        return np.array([[1.0, 0.0], [0.0, 0.0]], dtype=np.float32)
+    def __call__(
+        self,
+        image: np.ndarray,
+        *,
+        score_method: str = "max",
+    ) -> tuple[np.ndarray, float]:
+        self.score_methods.append(score_method)
+        if np.max(image) == 0:
+            anomaly_map = np.zeros((2, 2), dtype=np.float32)
+        else:
+            anomaly_map = np.array(
+                [[1.0, 0.0], [0.0, 0.0]],
+                dtype=np.float32,
+            )
+        return anomaly_map, float(np.max(anomaly_map))
 
 
 class MVTecEvaluationFlowTests(unittest.TestCase):
@@ -286,6 +298,9 @@ class MVTecEvaluationFlowTests(unittest.TestCase):
         self.assertEqual(len(models), 2)
         self.assertTrue(all(model.fit_images is not None for model in models))
         self.assertTrue(all(len(model.fit_images) == 1 for model in models))
+        self.assertTrue(
+            all(model.score_methods == ["mtop1p", "mtop1p"] for model in models)
+        )
 
         output = stdout.getvalue() + stderr.getvalue()
         self.assertIn("[MVTec 1/2][leather] Start fitting", output)

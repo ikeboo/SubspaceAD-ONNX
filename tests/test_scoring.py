@@ -1,5 +1,9 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+import cv2
 import numpy as np
 
 from subspaceadonnx import SubspaceAD
@@ -19,9 +23,94 @@ class ScoringTests(unittest.TestCase):
             pca_dim=3,
             spatial_centering=0.0,
             score_transform=transform,
+            blur=False,
         )
         model._fit_pca(self.train)
         return model
+
+    def test_call_returns_map_and_default_max_score_from_one_inference(self) -> None:
+        model = self._model("squared")
+        target_img = np.zeros((2, 2, 3), dtype=np.uint8)
+        features = np.zeros((4, 8), dtype=np.float32)
+        patch_scores = np.array([0.1, 0.3, 0.2, 0.4], dtype=np.float32)
+
+        with patch.object(
+            model,
+            "_extract_patch_features",
+            return_value=(features, (2, 2)),
+        ) as extract, patch.object(
+            model,
+            "_score_features",
+            return_value=patch_scores,
+        ) as score_features:
+            anomaly_map, image_score = model(target_img)
+
+        extract.assert_called_once_with(target_img)
+        score_features.assert_called_once_with(features)
+        np.testing.assert_allclose(anomaly_map, patch_scores.reshape(2, 2))
+        self.assertAlmostEqual(image_score, 0.4)
+
+    def test_call_supports_configurable_score_method(self) -> None:
+        model = self._model("squared")
+        target_img = np.zeros((2, 2, 3), dtype=np.uint8)
+        patch_scores = np.array([0.1, 0.3, 0.2, 0.4], dtype=np.float32)
+
+        with patch.object(
+            model,
+            "_extract_patch_features",
+            return_value=(np.zeros((4, 8), dtype=np.float32), (2, 2)),
+        ), patch.object(model, "_score_features", return_value=patch_scores):
+            _, image_score = model(target_img, score_method="mean")
+
+        self.assertAlmostEqual(image_score, 0.25)
+
+    def test_call_rejects_unknown_score_method(self) -> None:
+        model = self._model("squared")
+        target_img = np.zeros((2, 2, 3), dtype=np.uint8)
+
+        with patch.object(
+            model,
+            "_extract_patch_features",
+            return_value=(np.zeros((4, 8), dtype=np.float32), (2, 2)),
+        ), patch.object(
+            model,
+            "_score_features",
+            return_value=np.zeros(4, dtype=np.float32),
+        ):
+            with self.assertRaisesRegex(ValueError, "Unknown score_method"):
+                model(target_img, score_method="median")
+
+    def test_call_loads_string_path_as_bgr_image(self) -> None:
+        model = self._model("squared")
+        bgr = np.array(
+            [[[10, 20, 30], [40, 50, 60]]],
+            dtype=np.uint8,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "target.png"
+            self.assertTrue(cv2.imwrite(str(image_path), bgr))
+            with patch.object(
+                model,
+                "_extract_patch_features",
+                return_value=(np.zeros((2, 8), dtype=np.float32), (1, 2)),
+            ) as extract, patch.object(
+                model,
+                "_score_features",
+                return_value=np.array([0.1, 0.4], dtype=np.float32),
+            ):
+                anomaly_map, image_score = model(str(image_path))
+
+        np.testing.assert_array_equal(extract.call_args.args[0], bgr)
+        self.assertEqual(anomaly_map.shape, bgr.shape[:2])
+        self.assertAlmostEqual(image_score, 0.4)
+
+    def test_call_raises_for_missing_string_path(self) -> None:
+        model = self._model("squared")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_path = Path(temp_dir) / "missing.png"
+            with self.assertRaisesRegex(FileNotFoundError, "image_path not found"):
+                model(str(missing_path))
 
     def test_projection_identity_matches_explicit_reconstruction(self) -> None:
         model = self._model("squared")
